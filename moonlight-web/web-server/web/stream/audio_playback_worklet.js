@@ -39,10 +39,17 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
         // recurring for the rest of the session. Always re-priming to the
         // same deep target trades a longer mute per underrun for underruns
         // becoming rare in the first place.
-        this.primeSamples = 7200;        // 150ms
-        this.targetSamples = 7200;       // 150ms — level to skip back to on hard overrun
-        this.softOverrunSamples = 9600;  // 200ms — above this, speed up slightly
-        this.hardOverrunSamples = 16800; // 350ms — above this, skip ahead
+        //
+        // 240ms, up from 150ms: Tesla field session 2026-07-15 (FreezeWatch)
+        // showed a cellular radio micro-outage (~200-300ms downlink pause,
+        // zero packet loss, rx catch-up burst) draining the 150ms buffer and
+        // costing one audible underrun per stall. 240ms rides those out;
+        // audio-only latency, which the user has explicitly deprioritized
+        // vs. stutter (A/V sync doesn't matter here).
+        this.primeSamples = 11520;       // 240ms
+        this.targetSamples = 11520;      // 240ms — level to skip back to on hard overrun
+        this.softOverrunSamples = 14400; // 300ms — above this, speed up slightly
+        this.hardOverrunSamples = 21600; // 450ms — above this, skip ahead
         // True while refilling to primeSamples (at startup and after underrun).
         this.priming = true;
         // Direct PCM port from decode worker (bypasses main thread entirely)

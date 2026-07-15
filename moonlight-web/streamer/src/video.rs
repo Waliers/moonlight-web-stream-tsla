@@ -3,7 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -92,6 +92,7 @@ pub struct TrackSampleVideoDecoder {
     samples: Vec<Bytes>,
     frame_buffer: bytes::BytesMut,
     needs_idr: Arc<AtomicBool>,
+    last_idr_request: Option<Instant>,
     old_presentation_time: Duration,
 }
 
@@ -109,6 +110,7 @@ impl TrackSampleVideoDecoder {
             samples: Vec::new(),
             frame_buffer: bytes::BytesMut::with_capacity(1024 * 1024),
             needs_idr: Default::default(),
+            last_idr_request: None,
             old_presentation_time: Duration::ZERO,
         }
     }
@@ -345,7 +347,21 @@ impl VideoDecoder for TrackSampleVideoDecoder {
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
-            return DecodeResult::NeedIdr;
+            // Rate-limit IDR requests: the browser re-sends PLI every few hundred
+            // ms until a decodable keyframe arrives, and without this window each
+            // repeat produced ANOTHER IDR — every one a multi-frame-sized burst
+            // into the very link whose loss triggered the PLI, prolonging the
+            // freeze it was meant to end (the PLI→IDR storms seen in the field).
+            // If the in-flight IDR itself gets lost, the browser's next PLI lands
+            // after the window and a fresh IDR goes out.
+            let now = Instant::now();
+            let idr_in_flight = self
+                .last_idr_request
+                .is_some_and(|prev| now.duration_since(prev) < Duration::from_millis(300));
+            if !idr_in_flight {
+                self.last_idr_request = Some(now);
+                return DecodeResult::NeedIdr;
+            }
         }
 
         DecodeResult::Ok
@@ -388,9 +404,15 @@ fn packetize(
 }
 
 pub(crate) fn video_format_to_codec(format: VideoFormat) -> Option<RTCRtpCodecParameters> {
-    // For real-time streaming, waiting for NACK retransmissions adds latency (jitter).
-    // We only enable PLI (Picture Loss Indication) so the browser immediately requests a new IDR/I-frame
-    // if a packet is lost, which is much faster than waiting for UDP retransmission.
+    // NOTE: plain NACK retransmission IS active even though only "nack pli" is
+    // listed here. register_default_interceptors() in main.rs runs AFTER these
+    // codecs are registered and appends "nack" feedback to every video codec in
+    // the media engine (plus installs the Responder interceptor with an
+    // 8192-packet send history). So the negotiated SDP advertises both: the
+    // browser recovers isolated losses via retransmission when its jitter
+    // buffer has enough headroom (jitterBufferMs setting ≳ RTT), and falls back
+    // to PLI → IDR when it can't. PLI handling is in setup(); the IDR request
+    // is rate-limited in submit_decode_unit().
     let rtcp_feedback = vec![
         RTCPFeedback {
             typ: "nack".to_string(),

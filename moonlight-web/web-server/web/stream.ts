@@ -16,6 +16,7 @@ import { KeyboardModeEvent, ScreenKeyboard, TextEvent } from "./screen_keyboard.
 import { requestKeyboardLock } from "./iframe.js";
 import { FormModal } from "./component/modal/form.js";
 import { StreamStatsOverlay } from "./component/stream_stats.js";
+import { FreezeWatcher } from "./stream/freeze_watch.js";
 
 function getBuildVersionTag(): string {
     try {
@@ -91,6 +92,8 @@ class ViewerApp implements Component {
     private canvasRenderer: CanvasRenderer | null = null
     private settings: StreamSettings
     private statsOverlay: StreamStatsOverlay
+    private freezeWatcher: FreezeWatcher | null = null
+    private freezeWatchContextSent = false
 
     private streamerSize: [number, number]
 
@@ -236,6 +239,23 @@ class ViewerApp implements Component {
             this.statsOverlay.show()
         }
 
+        // Freeze forensics: runs for the whole session (independent of the
+        // stats overlay) and attributes every freeze — decoder-side gaps AND
+        // main-thread render stalls — then reports each event to the server
+        // console via ClientLog and to the stats overlay.
+        this.freezeWatcher = new FreezeWatcher(() => this.stream?.getPeer() ?? null)
+        this.freezeWatcher.setAudioDiagnosticsGetter(() => this.stream?.getAudioDiagnostics() ?? null)
+        this.freezeWatcher.setAudioStatsPoller(() => this.stream?.requestAudioWorkletStats())
+        this.freezeWatcher.onEvent((event, summary) => {
+            this.sendFreezeWatchContext()
+            this.stream?.sendClientLogMessage(
+                `[FreezeWatch] +${(event.atMs / 1000).toFixed(1)}s ${event.kind} ` +
+                `${Math.round(event.durationMs)}ms cause=${event.cause} | ${event.detail} ` +
+                `| totals: ${summary.videoFreezes} video / ${summary.renderStalls} render`
+            )
+        })
+        this.statsOverlay.setFreezeWatchGetter(() => this.freezeWatcher)
+
         // Add app info listener
         this.stream.addInfoListener(this.onInfo.bind(this))
 
@@ -281,6 +301,12 @@ class ViewerApp implements Component {
             document.title = `Stream: ${app.title}`
         } else if (data.type == "connectionComplete") {
             this.sidebar.onCapabilitiesChange(data.capabilities)
+            this.freezeWatcher?.start()
+            // Log the settings header even for sessions that never freeze —
+            // otherwise clean A/B runs leave no record of what they tested.
+            this.sendFreezeWatchContext()
+        } else if (data.type == "connectionTerminated" || data.type == "error") {
+            this.freezeWatcher?.stop()
         } else if (data.type == "videoTrack") {
             if (this.canvasRenderer) {
                 this.canvasRenderer.setVideoTrack(data.track)
@@ -288,6 +314,24 @@ class ViewerApp implements Component {
         } else if (data.type == "inputClientsChanged") {
             this.sidebar.onInputClientsChanged(data.count)
         }
+    }
+
+    /**
+     * One-time settings header for the FreezeWatch log so every field session
+     * is self-describing (the #1 question when reading a freeze log is "which
+     * settings?"). Sent at connectionComplete AND lazily before the first
+     * event, whichever comes first.
+     */
+    private sendFreezeWatchContext() {
+        if (this.freezeWatchContextSent) return
+        this.freezeWatchContextSent = true
+        const s = this.settings
+        this.stream?.sendClientLogMessage(
+            `[FreezeWatch] session: ${this.streamerSize[0]}x${this.streamerSize[1]}@${s.fps} ` +
+            `bitrate=${s.bitrate}kbps jitterBuffer=${s.jitterBufferMs}ms ` +
+            `canvas=${s.canvasRenderer} videoWorker=${s.useVideoWorker} audioWorker=${s.useAudioWorker} ` +
+            `build=${getBuildVersionTag()}`
+        )
     }
 
     private focusInput() {

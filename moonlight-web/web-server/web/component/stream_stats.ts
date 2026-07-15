@@ -1,4 +1,5 @@
 import { Stream, StreamAudioDiagnostics } from "../stream/index.js"
+import { FreezeWatcher } from "../stream/freeze_watch.js"
 import { InputDiagnostics } from "../stream/input.js"
 import { Component } from "./index.js"
 
@@ -37,6 +38,7 @@ export class StreamStatsOverlay implements Component {
     private streamGetter: (() => Stream | null) | null = null
     private workerDiagnosticsGetter: (() => WorkerDiagnosticsSnapshot | null) | null = null
     private inputDiagnosticsGetter: (() => InputDiagnostics | null) | null = null
+    private freezeWatchGetter: (() => FreezeWatcher | null) | null = null
     private statsEnabledCallback: ((enabled: boolean) => void) | null = null
     private statsReportCallback: ((text: string) => void) | null = null
     // How often to push the full stats dump to the server's console while the
@@ -61,6 +63,8 @@ export class StreamStatsOverlay implements Component {
     private elNackPli = document.createElement("span")
     private elFreeze = document.createElement("span")
     private elFreezeDetail = document.createElement("span")
+    private elFreezeWatch = document.createElement("span")
+    private elFreezeWatchLast = document.createElement("span")
     private elAssembly = document.createElement("span")
     private elInput = document.createElement("span")
     private elAudioBitrate = document.createElement("span")
@@ -133,6 +137,8 @@ export class StreamStatsOverlay implements Component {
             ["NACK / PLI", this.elNackPli],
             ["Freeze", this.elFreeze],
             ["Freeze Detail", this.elFreezeDetail],
+            ["Freeze Watch", this.elFreezeWatch],
+            ["Watch Last", this.elFreezeWatchLast],
             ["Frame Assembly", this.elAssembly],
             ["Input", this.elInput],
             ["Audio Bitrate", this.elAudioBitrate],
@@ -178,6 +184,10 @@ export class StreamStatsOverlay implements Component {
 
     setInputDiagnosticsGetter(getter: () => InputDiagnostics | null) {
         this.inputDiagnosticsGetter = getter
+    }
+
+    setFreezeWatchGetter(getter: () => FreezeWatcher | null) {
+        this.freezeWatchGetter = getter
     }
 
     setStatsEnabledCallback(cb: (enabled: boolean) => void) {
@@ -433,6 +443,17 @@ export class StreamStatsOverlay implements Component {
         this.elFreezeDetail.textContent = freezeCount > 0
             ? `avg ${avgFreezeDurationMs} ms, cause: ${freezeCause} | jitter: ${this.freezeCorrelationJitterSpikes}/${freezeCount}, rx-drop: ${this.freezeCorrelationReceiveDrop}/${freezeCount}, gp-poll: ${this.freezeCorrelationSlowGpPoll}/${freezeCount}`
             : `—`
+
+        // FreezeWatcher (always-on forensics) — per-event cause attribution,
+        // including render stalls the inbound-rtp freezeCount can't see.
+        const freezeWatcher = this.freezeWatchGetter?.() ?? null
+        if (freezeWatcher) {
+            this.elFreezeWatch.textContent = freezeWatcher.getSummaryLine()
+            this.elFreezeWatchLast.textContent = freezeWatcher.getLastEventLine()
+        } else {
+            this.elFreezeWatch.textContent = "—"
+            this.elFreezeWatchLast.textContent = "—"
+        }
 
         this.elVideoRes.textContent = videoWidth > 0 ? `${videoWidth}×${videoHeight}` : "—"
         this.elCodec.textContent = codec || "—"

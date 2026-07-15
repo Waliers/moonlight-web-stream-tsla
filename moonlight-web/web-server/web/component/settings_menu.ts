@@ -39,10 +39,17 @@ export type StreamSettings = {
 export function defaultStreamSettings(): StreamSettings {
     return {
         sidebarEdge: "left",
-        bitrate: 8000,
+        // Defaults mirror the "Gaming (Balanced)" preset — the field-validated
+        // safe config for the Tesla browser. The old defaults (8000 kbps, 0ms
+        // jitter buffer) matched "Gaming (Performance)", which sits ABOVE the
+        // measured ~6.3 Mbps whole-renderer-stall threshold (2026-07-07 A/B) —
+        // i.e. a fresh install froze regularly out of the box.
+        bitrate: 4000,
         packetSize: 1024,
         fps: 60,
-        jitterBufferMs: 0,
+        // 40ms is a deliberate FEEL choice, not a smoothness optimum — see the
+        // Gaming (Balanced) preset comment for the measured 40-vs-80 tradeoff.
+        jitterBufferMs: 40,
         videoSampleQueueSize: 1,
         videoSize: "1080p",
         videoSizeCustom: {
@@ -202,6 +209,19 @@ export class StreamSettingsComponent implements Component {
             // saturating the host GPU (encoder collapsed to ~46fps with ragged
             // pacing → freezes, PLI/IDR storms). 60fps maps 1:1 onto the
             // Tesla's 60Hz display.
+            // jitterBufferMs is the freeze-vs-feel dial, A/B-measured on the
+            // Tesla over cellular 2026-07-15 (RTT 38-47ms):
+            //   80ms → ZERO freezes in a 9-minute session, but input-to-photon
+            //          latency felt awful for gaming (the buffer delays every
+            //          displayed frame, so you SEE your input's effect ~80ms
+            //          later — receive-side buffering is paid in full by the
+            //          input→display loop even though the input path itself
+            //          isn't buffered).
+            //   40ms → best feel; accepts a few ~200-300ms freezes per session
+            //          when a NACK retransmit (needs ≳ RTT + ~20ms) or a radio
+            //          micro-outage outruns the buffer.
+            // 40 is the chosen gaming point. Raise toward 80-150 only for
+            // watch-mostly use (that's what the Streaming preset is for).
             {
                 label: "🎮 Gaming (Balanced)",
                 desc: "1080p 60fps 4 Mbps, 40ms buffer, direct render — smooth pacing, good responsiveness",

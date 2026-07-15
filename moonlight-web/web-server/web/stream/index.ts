@@ -1345,6 +1345,16 @@ export class Stream {
         }
     }
 
+    /**
+     * Ask the audio worklet for a one-shot stats post (underruns, buffer level)
+     * regardless of the statsEnabled flag. Used by the freeze watcher, which
+     * runs even when the stats overlay is hidden — the reply lands in the same
+     * port.onmessage handler that feeds getAudioDiagnostics().
+     */
+    requestAudioWorkletStats() {
+        this.audioWorkletNode?.port.postMessage({ type: 'get-stats' })
+    }
+
     getAudioDiagnostics(): StreamAudioDiagnostics {
         const currentTime = this.audioContext?.currentTime ?? 0
         // In worker mode, audioPacketsDecoded stays 0 since playPcm() is bypassed.

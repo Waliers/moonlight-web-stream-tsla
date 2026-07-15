@@ -157,8 +157,16 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
             }
 
             // Flush interval — batches multiple Opus frames into one DataChannel message.
-            // At 48kHz/5ms per frame, 10ms accumulates ~2 frames per send.
-            let mut interval = time::interval(Duration::from_millis(10));
+            // At 48kHz/5ms per frame, 20ms accumulates ~4 frames per send (~50 msg/s).
+            // Field data (2026-07-07) showed the Tesla renderer stalls scale with
+            // per-packet/per-message cost, and every DataChannel message costs a
+            // main-thread onmessage + a worker postMessage on the client — so fewer,
+            // larger messages directly buy back Tesla CPU budget. Latency impact is
+            // irrelevant: the playback worklet primes 150ms regardless. The tradeoff
+            // is 20ms (not more) because the channel is unreliable (max_retransmits
+            // 0) — one lost SCTP message now costs 20ms of audio instead of 10ms,
+            // which Opus PLC still conceals well.
+            let mut interval = time::interval(Duration::from_millis(20));
 
             loop {
                 tokio::select! {
