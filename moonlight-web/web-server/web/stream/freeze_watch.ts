@@ -57,6 +57,8 @@ type StatsSample = {
     jitter: number
     jitterBufferDelay: number
     jitterBufferEmittedCount: number
+    fecPacketsReceived: number
+    fecPacketsDiscarded: number
     audioUnderruns: number
 }
 
@@ -247,6 +249,8 @@ export class FreezeWatcher {
                     jitter: report.jitter ?? 0,
                     jitterBufferDelay: report.jitterBufferDelay ?? 0,
                     jitterBufferEmittedCount: report.jitterBufferEmittedCount ?? 0,
+                    fecPacketsReceived: report.fecPacketsReceived ?? 0,
+                    fecPacketsDiscarded: report.fecPacketsDiscarded ?? 0,
                     audioUnderruns: this.audioDiagGetter?.()?.underruns ?? 0,
                 }
             }
@@ -298,11 +302,14 @@ export class FreezeWatcher {
             // RTCP's heavily-smoothed jitter barely moves, the pipe just stops
             // for 100-300ms and then bursts). Confirmed on Tesla 2026-07-15:
             // rx spiked to 66-69/s (avg 57) with 0 loss and a healthy rAF.
-            // Threshold 1.10: normal 1Hz sampling noise at 60fps is ~±2 frames
-            // (1.03), while real post-stall flushes measured 1.15-1.21 — a
-            // marginal one (67/s vs avg 58, +22s event same day) rounded to
-            // exactly 1.15 and slipped through to "unattributed".
-            const rxBurst = this.emaFrameRate > 0 && rxRate > this.emaFrameRate * 1.10
+            // Threshold 1.05: this flag is only consulted DURING a freeze tick,
+            // where any rx meaningfully above baseline means delivery caught up
+            // within the window — the link-stall signature by definition. Two
+            // real catch-up bursts straddled earlier thresholds (67/s vs a
+            // 66.7 cutoff at 1.15; 64/s vs 64.9 at 1.10), landing in
+            // "unattributed". 1.05 still clears 1Hz sampling noise (~±2
+            // frames at 60fps ≈ 1.03).
+            const rxBurst = this.emaFrameRate > 0 && rxRate > this.emaFrameRate * 1.05
             const decodeSpike = this.emaDecodeMsPerFrame > 0
                 && decodeMsPerFrame > Math.max(this.emaDecodeMsPerFrame * 2, this.emaDecodeMsPerFrame + 8)
             // Frames waited noticeably longer than usual in the jitter buffer:
@@ -322,6 +329,14 @@ export class FreezeWatcher {
                 // chain stalls for ~RTT while late frames get discarded.
                 // Remedy: jitterBufferMs ≳ 2×RTT hides these entirely.
                 cause = "nack-recovery"
+            } else if (keyDelta > 0) {
+                // A keyframe arrived that the browser never asked for (no
+                // PLI, no loss on the WebRTC leg): the Sunshine→streamer leg
+                // dropped a frame and moonlight-common requested recovery.
+                // Matches streamer-side "Network dropped 1 frame" log lines
+                // (Tesla field 2026-07-16). Remedy is host-side: RFI
+                // capability shortens these to a single-frame gap.
+                cause = "host-frame-drop"
             } else if (rxDropped) {
                 cause = "receive-gap" // sender/encoder produced no frames — host-side or uplink stall
             } else if (jbSpike) {
@@ -351,6 +366,7 @@ export class FreezeWatcher {
                 ` decode=${decodeMsPerFrame.toFixed(1)}ms(avg ${this.emaDecodeMsPerFrame.toFixed(1)})` +
                 ` jb=${jbAvgMs.toFixed(1)}ms(avg ${this.emaJbDelayMs.toFixed(1)})` +
                 ` jitter=${(cur.jitter * 1000).toFixed(0)}ms` +
+                ` fecRx=+${cur.fecPacketsReceived - prev.fecPacketsReceived}` +
                 (flags.length > 0 ? ` ${flags.join(" ")}` : "")
 
             this.totalFreezeMs += freezeMs

@@ -9,7 +9,7 @@ use std::{
 use bytes::Bytes;
 use log::{debug, error, info, warn};
 use moonlight_common::stream::{
-    bindings::{DecodeResult, SupportedVideoFormats, VideoDecodeUnit, VideoFormat},
+    bindings::{Capabilities, DecodeResult, SupportedVideoFormats, VideoDecodeUnit, VideoFormat},
     video::VideoDecoder,
 };
 use webrtc::{
@@ -33,7 +33,7 @@ use webrtc::{
 
 use crate::{
     StreamConnection,
-    sender::{SequencedTrackLocalStaticRTP, TrackLocalSender},
+    sender::{SequencedTrackLocalStaticRTP, TrackLocalSender, VideoFecConfig},
     video::{
         annexb::AnnexBSplitter,
         h264::{payloader::H264Payloader, reader::H264Reader},
@@ -42,6 +42,7 @@ use crate::{
 };
 
 mod annexb;
+pub(crate) mod fec;
 mod h264;
 mod h265;
 
@@ -65,7 +66,60 @@ pub fn register_video_codecs(
         media_engine.register_codec(codec, RTPCodecType::Video)?;
     }
 
+    // RED + ULPFEC, for the optional forward-error-correction layer. Only
+    // negotiated when the browser offers them (all Chromium/WebKit/Gecko do
+    // for video); registering them costs nothing when FEC is disabled.
+    // Registered before register_default_interceptors so configure_nack's
+    // register_feedback also reaches them (harmless, and keeps the responder
+    // active on the RED-typed stream).
+    media_engine.register_codec(
+        RTCRtpCodecParameters {
+            capability: RTCRtpCodecCapability {
+                mime_type: "video/red".to_owned(),
+                clock_rate: 90000,
+                channels: 0,
+                sdp_fmtp_line: "".to_owned(),
+                rtcp_feedback: vec![],
+            },
+            payload_type: 118,
+            ..Default::default()
+        },
+        RTPCodecType::Video,
+    )?;
+    media_engine.register_codec(
+        RTCRtpCodecParameters {
+            capability: RTCRtpCodecCapability {
+                mime_type: "video/ulpfec".to_owned(),
+                clock_rate: 90000,
+                channels: 0,
+                sdp_fmtp_line: "".to_owned(),
+                rtcp_feedback: vec![],
+            },
+            payload_type: 116,
+            ..Default::default()
+        },
+        RTPCodecType::Video,
+    )?;
+
     Ok(())
+}
+
+/// Wait (bounded) for the remote offer and check whether it advertises both
+/// RED and ULPFEC for video — the prerequisites for sending FEC. The offer
+/// usually arrives before video setup, but stream start runs in parallel
+/// with signaling, so this may briefly block the (blocking) setup thread.
+fn blocking_sniff_red_ulpfec(stream: &StreamConnection) -> bool {
+    stream.runtime.block_on(async {
+        for _ in 0..60 {
+            if let Some(description) = stream.peer.remote_description().await {
+                let sdp = description.sdp.to_ascii_lowercase();
+                return sdp.contains(" red/90000") && sdp.contains(" ulpfec/90000");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        warn!("[Stream] No remote description after 3s, assuming no RED/ULPFEC support");
+        false
+    })
 }
 
 enum VideoCodec {
@@ -189,8 +243,46 @@ impl VideoDecoder for TrackSampleVideoDecoder {
         // now attach the correct track without triggering renegotiation.
         let pre_sender = self.sender.stream.pre_video_sender.blocking_lock().take();
 
+        // ULPFEC/RED forward error correction: when enabled and the browser
+        // offered red+ulpfec, the track is created as "video/red" and every
+        // packet is RED-wrapped (media inside), with parity packets appended
+        // per frame — a single lost packet is then reconstructed by the
+        // receiver with zero retransmit round-trip. H264-only for now (the
+        // only codec field-verified on the Tesla).
+        let fec_wanted = self.sender.stream.settings.video_fec
+            && matches!(format, VideoFormat::H264 | VideoFormat::H264High8_444)
+            && pre_sender.is_some();
+        let fec_negotiable = fec_wanted && blocking_sniff_red_ulpfec(&self.sender.stream);
+        if fec_wanted && !fec_negotiable {
+            info!("[Stream] Video FEC requested but remote offer lacks RED/ULPFEC, sending plain");
+        }
+
+        let (track_capability, fec_config) = if fec_negotiable {
+            let media_fmtp_hint = match format {
+                VideoFormat::H264 => Some("42e01f".to_string()),
+                VideoFormat::H264High8_444 => Some("640032".to_string()),
+                _ => None,
+            };
+            (
+                RTCRtpCodecCapability {
+                    mime_type: "video/red".to_owned(),
+                    clock_rate: 90000,
+                    channels: 0,
+                    sdp_fmtp_line: "".to_owned(),
+                    rtcp_feedback: vec![],
+                },
+                Some(VideoFecConfig {
+                    rtp_sender: pre_sender.clone().expect("checked by fec_wanted"),
+                    media_mime: "video/h264".to_owned(),
+                    media_fmtp_hint,
+                }),
+            )
+        } else {
+            (codec.capability.clone(), None)
+        };
+
         let video_track = Arc::new(TrackLocalStaticRTP::new(
-            codec.capability.clone(),
+            track_capability,
             "video".to_string(),
             "moonlight".to_string(),
         ));
@@ -199,6 +291,7 @@ impl VideoDecoder for TrackSampleVideoDecoder {
             self.sender.blocking_activate_via_replace_track(
                 video_track,
                 rtp_sender,
+                fec_config,
                 move |packet| {
                     let packet = packet.as_any();
                     if packet.is::<PictureLossIndication>() {
@@ -369,6 +462,22 @@ impl VideoDecoder for TrackSampleVideoDecoder {
 
     fn supported_formats(&self) -> SupportedVideoFormats {
         self.supported_formats
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        // Reference Frame Invalidation for H264. Tesla field sessions
+        // (2026-07-16) showed ~1 frame per minute lost on the
+        // Sunshine→streamer LOOPBACK leg ("Network dropped 1 frame" — host
+        // under game+encode load), each costing a ~300-600ms freeze because
+        // recovery fell back to a full IDR round trip. With RFI declared,
+        // moonlight-common instead asks Sunshine to encode the next frame
+        // referencing a pre-loss frame: a normal-sized P-frame, single-frame
+        // gap, no IDR burst. The browser's copies of those references are
+        // intact because the WebRTC leg has its own loss protection
+        // (ULPFEC + NACK); when the browser itself loses decoder state it
+        // sends PLI → DecodeResult::NeedIdr → LiRequestIdrFrame, which
+        // always forces a real IDR regardless of this capability.
+        Capabilities::REFERENCE_FRAME_INVALIDATION_AVC
     }
 }
 

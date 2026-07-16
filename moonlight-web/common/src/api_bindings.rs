@@ -254,6 +254,10 @@ pub enum StreamClientMessage {
         video_supported_formats: u32,
         video_colorspace: StreamColorspace,
         video_color_range_full: bool,
+        /// ULPFEC/RED forward error correction on the video track. Serde
+        /// default keeps auth messages from older (cached) clients parseable.
+        #[serde(default = "video_fec_default")]
+        video_fec: bool,
     },
     /// Attach as an input-only (keyboard/mouse/touch/controller) client to an
     /// already-running stream for `host_id`, instead of starting a new one.
@@ -266,6 +270,10 @@ pub enum StreamClientMessage {
     ClientLog {
         log: String,
     },
+}
+
+fn video_fec_default() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug, TS, Clone, Default)]

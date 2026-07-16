@@ -1,9 +1,9 @@
 ﻿use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use log::warn;
+use log::{info, warn};
 use tokio::sync::{
     mpsc::{Receiver, Sender, channel, error::TryRecvError},
 };
@@ -22,6 +22,7 @@ use webrtc::{
 };
 
 use crate::StreamConnection;
+use crate::video::fec::{UlpfecGenerator, red_wrap};
 
 pub struct TrackLocalSender<Track>
 where
@@ -111,14 +112,19 @@ impl TrackLocalSender<SequencedTrackLocalStaticRTP> {
     /// Activate the sender by replacing the track on an existing transceiver sender.
     /// This is codec-agnostic: the transceiver was added with all codecs in the SDP,
     /// and we now attach the track for whichever codec Moonlight actually selected.
-    /// No renegotiation is triggered.
+    /// No renegotiation is triggered. When `fec` is set, the track must have been
+    /// created with the "video/red" capability — see [`VideoFecConfig`].
     pub fn blocking_activate_via_replace_track(
         &mut self,
         track: Arc<TrackLocalStaticRTP>,
         rtp_sender: Arc<RTCRtpSender>,
+        fec: Option<VideoFecConfig>,
         mut on_packet: impl FnMut(Box<dyn Packet + Send + Sync>) + Send + 'static,
     ) -> Result<(), anyhow::Error> {
-        let sequenced = Arc::new(SequencedTrackLocalStaticRTP::from_arc(track.clone()));
+        let sequenced = Arc::new(SequencedTrackLocalStaticRTP::from_arc_with_fec(
+            track.clone(),
+            fec,
+        ));
 
         // Attach the track to the pre-existing transceiver sender.
         // The inner TrackLocalStaticRTP is what pion binds to its interceptor chain.
@@ -293,9 +299,104 @@ impl TrackLike for TrackLocalStaticSample {
     }
 }
 
+/// Configuration for the ULPFEC/RED layer of a video track. Present only when
+/// the remote offer advertised red+ulpfec and the setting is enabled; the
+/// track itself must then be created with the "video/red" capability so the
+/// binding stamps the negotiated RED payload type on every outgoing packet.
+pub struct VideoFecConfig {
+    /// Used to look up the negotiated media/ulpfec payload types once bound.
+    pub rtp_sender: Arc<RTCRtpSender>,
+    /// Mime of the inner media codec, lowercase (e.g. "video/h264").
+    pub media_mime: String,
+    /// fmtp substring disambiguating between multiple entries of the same
+    /// mime (e.g. "42e01f" vs "640032"); falls back to first mime match.
+    pub media_fmtp_hint: Option<String>,
+}
+
+struct FecRuntime {
+    config: VideoFecConfig,
+    /// (media_pt, ulpfec_pt) — resolved from the negotiated codec list on
+    /// first bound write and cached. These are the payload types the browser
+    /// expects inside RED blocks.
+    resolved: OnceLock<(u8, u8)>,
+    generator: Mutex<UlpfecGenerator>,
+    unresolved_drops: AtomicU32,
+}
+
+impl FecRuntime {
+    /// The negotiated parameters are authoritative: they are what our SDP
+    /// answer declared, which is what the browser configured its RED
+    /// demuxer/FEC receiver with. Only callable usefully once the track is
+    /// bound (which implies negotiation completed).
+    async fn resolve(&self) -> Option<(u8, u8)> {
+        if let Some(pts) = self.resolved.get() {
+            return Some(*pts);
+        }
+
+        let params = self.config.rtp_sender.get_parameters().await;
+        let mut media_pt = None;
+        let mut media_pt_any = None;
+        let mut ulpfec_pt = None;
+        for codec in &params.rtp_parameters.codecs {
+            let mime = codec.capability.mime_type.to_ascii_lowercase();
+            if mime == "video/ulpfec" {
+                ulpfec_pt.get_or_insert(codec.payload_type);
+            } else if mime == self.config.media_mime {
+                media_pt_any.get_or_insert(codec.payload_type);
+                let hint_matches = self
+                    .config
+                    .media_fmtp_hint
+                    .as_deref()
+                    .is_none_or(|hint| codec.capability.sdp_fmtp_line.contains(hint));
+                if hint_matches {
+                    media_pt.get_or_insert(codec.payload_type);
+                }
+            }
+        }
+
+        let media_pt = media_pt.or(media_pt_any)?;
+        let ulpfec_pt = ulpfec_pt?;
+        let pts = *self.resolved.get_or_init(|| (media_pt, ulpfec_pt));
+        info!(
+            "[Stream] Video FEC active: RED-wrapped media pt={} + ulpfec pt={}",
+            pts.0, pts.1
+        );
+        Some(pts)
+    }
+}
+
+/// Test hook: `FEC_TEST_DROP_PERCENT=N` silently discards N% of outgoing
+/// video media packets AFTER they were recorded for FEC and BEFORE they reach
+/// the wire — the receiver sees genuine loss that NACK retransmission cannot
+/// repair (the responder never cached the packet), so any recovery observed
+/// can only come from FEC. Used by the local E2E harness; never set in
+/// production.
+fn fec_test_drop_percent() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FEC_TEST_DROP_PERCENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+            .min(50)
+    })
+}
+
+fn fec_test_should_drop(counter: &AtomicU32) -> bool {
+    let percent = fec_test_drop_percent();
+    if percent == 0 {
+        return false;
+    }
+    // Deterministic spread: drop every (100/percent)-th packet.
+    let n = counter.fetch_add(1, Ordering::Relaxed);
+    n % (100 / percent) == (100 / percent) - 1
+}
+
 pub struct SequencedTrackLocalStaticRTP {
     track: Arc<TrackLocalStaticRTP>,
     sequence_number: AtomicU16,
+    fec: Option<FecRuntime>,
+    test_drop_counter: AtomicU32,
 }
 
 impl From<TrackLocalStaticRTP> for SequencedTrackLocalStaticRTP {
@@ -303,16 +404,98 @@ impl From<TrackLocalStaticRTP> for SequencedTrackLocalStaticRTP {
         Self {
             track: Arc::new(value),
             sequence_number: AtomicU16::new(0),
+            fec: None,
+            test_drop_counter: AtomicU32::new(0),
         }
     }
 }
 
 impl SequencedTrackLocalStaticRTP {
     pub(crate) fn from_arc(track: Arc<TrackLocalStaticRTP>) -> Self {
+        Self::from_arc_with_fec(track, None)
+    }
+
+    pub(crate) fn from_arc_with_fec(
+        track: Arc<TrackLocalStaticRTP>,
+        fec: Option<VideoFecConfig>,
+    ) -> Self {
         Self {
             track,
             sequence_number: AtomicU16::new(0),
+            fec: fec.map(|config| FecRuntime {
+                config,
+                resolved: OnceLock::new(),
+                generator: Mutex::new(UlpfecGenerator::default()),
+                unresolved_drops: AtomicU32::new(0),
+            }),
+            test_drop_counter: AtomicU32::new(0),
         }
+    }
+
+    /// FEC path: RED-wrap the media packet, record it for parity, and after
+    /// the frame's marker packet emit the ULPFEC parity packets (RED-wrapped,
+    /// consuming sequence numbers in the same space, as Chromium requires).
+    async fn write_with_fec(
+        &self,
+        mut sample: rtp::packet::Packet,
+        extensions: &[HeaderExtension],
+        fec: &FecRuntime,
+        media_pt: u8,
+        ulpfec_pt: u8,
+    ) -> Result<(), anyhow::Error> {
+        let timestamp = sample.header.timestamp;
+        let marker = sample.header.marker;
+
+        sample.header.sequence_number = self.sequence_number.fetch_add(1, Ordering::Relaxed);
+
+        {
+            let mut generator = fec.generator.lock().unwrap();
+            // A frame that never saw its marker (e.g. packetize error on the
+            // last NAL) would otherwise leak its packets into the next
+            // frame's parity groups. Cross-frame parity is legal ULPFEC, but
+            // an unbounded group is not — flush at the timestamp boundary.
+            if generator.pending_timestamp().is_some_and(|ts| ts != timestamp) {
+                generator.reset();
+            }
+            generator.push_media_packet(
+                sample.header.sequence_number,
+                marker,
+                timestamp,
+                media_pt,
+                sample.payload.clone(),
+            );
+        }
+
+        sample.payload = red_wrap(media_pt, &sample.payload);
+        // Test hook: skip the wire write (loss simulation) but keep the FEC
+        // record above and the parity emission below — the receiver must then
+        // recover this packet from parity alone.
+        if !fec_test_should_drop(&self.test_drop_counter) {
+            self.track
+                .write_rtp_with_extensions(&sample, extensions)
+                .await?;
+        }
+
+        if marker {
+            let parities = fec.generator.lock().unwrap().finish_frame();
+            for parity in parities {
+                let packet = rtp::packet::Packet {
+                    header: rtp::header::Header {
+                        version: 2,
+                        sequence_number: self.sequence_number.fetch_add(1, Ordering::Relaxed),
+                        timestamp,
+                        // payload_type and ssrc are stamped by the binding
+                        ..Default::default()
+                    },
+                    payload: red_wrap(ulpfec_pt, &parity),
+                };
+                self.track
+                    .write_rtp_with_extensions(&packet, extensions)
+                    .await?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -320,7 +503,9 @@ impl TrackLike for SequencedTrackLocalStaticRTP {
     type Sample = rtp::packet::Packet;
 
     fn sample_size(sample: &Self::Sample) -> usize {
-        // 12 bytes fixed RTP header + payload
+        // 12 bytes fixed RTP header + payload. When FEC is active the wire
+        // adds ~15% (RED byte + parity packets) that the pacer doesn't see —
+        // fine, since the pacing rate is 3x the stream bitrate.
         12 + sample.payload.len()
     }
 
@@ -334,7 +519,33 @@ impl TrackLike for SequencedTrackLocalStaticRTP {
             return Ok(());
         }
 
+        if let Some(fec) = &self.fec {
+            if let Some((media_pt, ulpfec_pt)) = fec.resolve().await {
+                return self
+                    .write_with_fec(sample, extensions, fec, media_pt, ulpfec_pt)
+                    .await;
+            }
+            // Bound but payload types not resolvable: sending un-wrapped
+            // payloads on a RED-typed track would give the browser garbage,
+            // so drop and complain. Should be unreachable — FEC is only
+            // enabled after red+ulpfec were seen in the remote offer.
+            let drops = fec.unresolved_drops.fetch_add(1, Ordering::Relaxed);
+            if drops % 300 == 0 {
+                warn!(
+                    "[Stream]: video FEC payload types not negotiated; dropping video \
+                     ({drops} packets so far). Disable the Video FEC setting to recover."
+                );
+            }
+            return Ok(());
+        }
+
         sample.header.sequence_number = self.sequence_number.fetch_add(1, Ordering::Relaxed);
+
+        // Test hook (control runs): simulate unrecoverable loss on the plain
+        // path too, so FEC-on vs FEC-off can be compared under identical loss.
+        if fec_test_should_drop(&self.test_drop_counter) {
+            return Ok(());
+        }
 
         self.track
             .write_rtp_with_extensions(&sample, extensions)

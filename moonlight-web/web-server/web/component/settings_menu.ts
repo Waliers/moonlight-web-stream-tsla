@@ -22,6 +22,7 @@ export type StreamSettings = {
      * 50-100 trades latency for smoothness on jittery links (LTE). */
     jitterBufferMs: number
     dontForceH264: boolean
+    videoFec: boolean
     canvasRenderer: boolean
     playAudioLocal: boolean
     keepAudioAlive: boolean
@@ -57,6 +58,11 @@ export function defaultStreamSettings(): StreamSettings {
             height: 540,
         },
         dontForceH264: false,
+        // ULPFEC/RED loss protection: the streamer sends ~10-15% parity so a
+        // single lost packet is reconstructed instantly — no retransmit
+        // round-trip, no freeze, no added latency. Falls back to plain
+        // sending automatically if the browser doesn't offer RED/ULPFEC.
+        videoFec: true,
         canvasRenderer: true,
         playAudioLocal: false,
         keepAudioAlive: true,
@@ -124,6 +130,7 @@ export class StreamSettingsComponent implements Component {
     private fps: InputComponent
     private jitterBufferMs: InputComponent
     private forceH264: InputComponent
+    private videoFec: InputComponent
     private canvasRenderer: InputComponent
 
     private videoSize: SelectComponent
@@ -438,6 +445,14 @@ export class StreamSettingsComponent implements Component {
         this.forceH264.addChangeListener(this.onSettingsChange.bind(this))
         this.forceH264.mount(advancedSection)
 
+        // Video FEC (ULPFEC/RED loss protection)
+        this.videoFec = new InputComponent("videoFec", "checkbox", "Video FEC — instant packet-loss recovery, ~15% bandwidth", {
+            defaultValue: defaultSettings.videoFec.toString(),
+            checked: settings?.videoFec ?? defaultSettings.videoFec
+        })
+        this.videoFec.addChangeListener(this.onSettingsChange.bind(this))
+        this.videoFec.mount(advancedSection)
+
         // Use Canvas Renderer
         this.canvasRenderer = new InputComponent("canvasRenderer", "checkbox", "Use Canvas Renderer (Experimental)", {
             defaultValue: defaultSettings.canvasRenderer.toString(),
@@ -608,6 +623,7 @@ export class StreamSettingsComponent implements Component {
         }
         settings.videoSampleQueueSize = parseInt(this.videoSampleQueueSize.getValue())
         settings.dontForceH264 = this.forceH264.isChecked()
+        settings.videoFec = this.videoFec.isChecked()
         settings.canvasRenderer = this.canvasRenderer.isChecked()
 
         settings.playAudioLocal = this.playAudioLocal.isChecked()

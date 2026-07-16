@@ -87,6 +87,7 @@ export class StreamStatsOverlay implements Component {
     private prevAudioMessagesReceived = 0
     private prevNackCount = 0
     private prevPliCount = 0
+    private prevFecPacketsReceived = 0
     private prevKeyFramesDecoded = 0
     private prevFramesDecoded = 0
     private prevTotalAssemblyTime = 0
@@ -286,6 +287,8 @@ export class StreamStatsOverlay implements Component {
         let audioMessagesReceived = 0
         let nackCount = 0
         let pliCount = 0
+        let fecPacketsReceived = 0
+        let fecPacketsDiscarded = 0
         let keyFramesDecoded = 0
         let freezeCount = 0
         let totalFreezesDuration = 0
@@ -311,6 +314,8 @@ export class StreamStatsOverlay implements Component {
                 packetsLost = report.packetsLost ?? 0
                 nackCount = report.nackCount ?? 0
                 pliCount = report.pliCount ?? 0
+                fecPacketsReceived = report.fecPacketsReceived ?? 0
+                fecPacketsDiscarded = report.fecPacketsDiscarded ?? 0
                 keyFramesDecoded = report.keyFramesDecoded ?? 0
                 freezeCount = report.freezeCount ?? 0
                 totalFreezesDuration = report.totalFreezesDuration ?? 0
@@ -358,7 +363,8 @@ export class StreamStatsOverlay implements Component {
             const nackDelta = nackCount - this.prevNackCount
             const pliDelta  = pliCount  - this.prevPliCount
             const keyDelta  = keyFramesDecoded - this.prevKeyFramesDecoded
-            this.elNackPli.textContent = `NACK ${Math.round(nackDelta / elapsed)}/s, PLI ${Math.round(pliDelta / elapsed)}/s, keyframes ${Math.round(keyDelta / elapsed)}/s (${keyFramesDecoded} total)`
+            const fecDelta  = fecPacketsReceived - this.prevFecPacketsReceived
+            this.elNackPli.textContent = `NACK ${Math.round(nackDelta / elapsed)}/s, PLI ${Math.round(pliDelta / elapsed)}/s, keyframes ${Math.round(keyDelta / elapsed)}/s (${keyFramesDecoded} total), FEC ${Math.round(fecDelta / elapsed)}/s (${fecPacketsReceived} rx, ${fecPacketsDiscarded} disc)`
 
             const assembledDelta = framesAssembledFromMultiplePackets - this.prevFramesAssembled
             const assemblyTimeDelta = totalAssemblyTime - this.prevTotalAssemblyTime
@@ -547,6 +553,7 @@ export class StreamStatsOverlay implements Component {
         this.prevAudioMessagesReceived = audioMessagesReceived
         this.prevNackCount = nackCount
         this.prevPliCount = pliCount
+        this.prevFecPacketsReceived = fecPacketsReceived
         this.prevKeyFramesDecoded = keyFramesDecoded
         this.prevFramesDecoded = framesDecoded
         this.prevTotalAssemblyTime = totalAssemblyTime

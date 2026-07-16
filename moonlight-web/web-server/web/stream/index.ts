@@ -190,6 +190,7 @@ export class Stream {
                 video_supported_formats: createSupportedVideoFormatsBits(supportedVideoFormats),
                 video_colorspace: "Rec709", // TODO <---
                 video_color_range_full: true, // TODO <---
+                video_fec: this.settings.videoFec,
             }
         }
 

@@ -93,6 +93,7 @@ pub async fn start_host(
                 video_supported_formats,
                 video_colorspace,
                 video_color_range_full,
+                video_fec,
             } => {
                 info!(
                     "[Stream]: received auth request for host={host_id} app={app_id} ({width}x{height}@{fps}fps)"
@@ -116,6 +117,7 @@ pub async fn start_host(
                     }),
                     video_colorspace: video_colorspace.into(),
                     video_color_range_full,
+                    video_fec,
                 };
 
                 run_primary_stream(
@@ -508,6 +510,7 @@ fn default_placeholder_stream_settings() -> StreamSettings {
         video_supported_formats: SupportedVideoFormats::H264,
         video_colorspace: Colorspace::Rec709,
         video_color_range_full: false,
+        video_fec: true,
     }
 }
 

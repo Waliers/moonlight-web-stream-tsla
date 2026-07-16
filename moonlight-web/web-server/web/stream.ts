@@ -328,7 +328,7 @@ class ViewerApp implements Component {
         const s = this.settings
         this.stream?.sendClientLogMessage(
             `[FreezeWatch] session: ${this.streamerSize[0]}x${this.streamerSize[1]}@${s.fps} ` +
-            `bitrate=${s.bitrate}kbps jitterBuffer=${s.jitterBufferMs}ms ` +
+            `bitrate=${s.bitrate}kbps jitterBuffer=${s.jitterBufferMs}ms fec=${s.videoFec} ` +
             `canvas=${s.canvasRenderer} videoWorker=${s.useVideoWorker} audioWorker=${s.useAudioWorker} ` +
             `build=${getBuildVersionTag()}`
         )

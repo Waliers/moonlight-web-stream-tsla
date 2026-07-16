@@ -20,6 +20,10 @@ pub struct StreamSettings {
     pub video_supported_formats: SupportedVideoFormats,
     pub video_colorspace: Colorspace,
     pub video_color_range_full: bool,
+    /// Send ULPFEC/RED forward error correction on the video track, letting
+    /// the browser reconstruct single lost packets instantly (no retransmit
+    /// round-trip, no added latency) at ~10-15% bandwidth overhead.
+    pub video_fec: bool,
 }
 
 pub fn serialize_json<T>(message: &T) -> Option<String>
