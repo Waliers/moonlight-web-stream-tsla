@@ -29,7 +29,7 @@ export class CanvasRenderer {
     private videoDrawnCount: number = 0
     private videoNewFrameCount: number = 0  // times we detected a genuinely new frame
 
-    constructor(canvasElement: HTMLCanvasElement, stretchToFit: boolean, enableWorkerAcceleration: boolean = true) {
+    constructor(canvasElement: HTMLCanvasElement, stretchToFit: boolean, enableWorkerAcceleration: boolean = true, drawOnArrival: boolean = true) {
         this.canvas = canvasElement
         this.ctx = null
         this.videoTrack = null
@@ -39,6 +39,7 @@ export class CanvasRenderer {
         this.latestFrame = null
         this.stretchToFit = stretchToFit
         this.workerAccelerationAllowed = enableWorkerAcceleration
+        this.drawOnArrival = drawOnArrival
         // Use hidden video element source by default — it leverages the browser's
         // native frame timing/smoothing instead of the batchy MediaStreamTrackProcessor pipeline.
         // Falls back to MSTP if the video element doesn't produce frames.
@@ -136,6 +137,9 @@ export class CanvasRenderer {
         const mainMaxGapMs = this.drawGapMax
         const mainJumpCount = this.drawJumpCount
 
+        const mainDrawLatencyAvg = this.drawLatencyAvgMs
+        const mainDrawLatencyMax = this.drawLatencyMaxMs
+
         // Expose a rolling main-thread gap window instead of a lifetime max.
         // The stats overlay polls periodically, so resetting here makes max-gap
         // reflect only the most recent interval and highlights fresh stutter spikes.
@@ -144,6 +148,7 @@ export class CanvasRenderer {
             this.drawGapAvg = -1
             this.drawGapMax = -1
             this.drawJumpCount = 0
+            this.drawLatencyMaxMs = -1
         }
 
         return {
@@ -163,6 +168,11 @@ export class CanvasRenderer {
             minGapMs:        isWorkerActive ? this.workerMinGapMs          : mainMinGapMs,
             avgGapMs:        isWorkerActive ? this.workerAvgGapMs          : mainAvgGapMs,
             maxGapMs:        isWorkerActive ? this.workerMaxGapMs          : mainMaxGapMs,
+            // Arrival→draw latency (main-thread mode only): the A/B signal
+            // for the drawOnArrival setting (~0ms on-arrival vs 0-16.7ms rAF)
+            drawLatencyAvgMs: isWorkerActive || isVideoElementActive ? -1 : mainDrawLatencyAvg,
+            drawLatencyMaxMs: isWorkerActive || isVideoElementActive ? -1 : mainDrawLatencyMax,
+            drawOnArrival:   this.drawOnArrival,
             videoElementMode: isVideoElementActive,
         }
     }
@@ -344,17 +354,6 @@ export class CanvasRenderer {
         }
     }
 
-    private scheduleDraw() {
-        if (!this.isRunning || this.workerRenderingEnabled || this.useVideoElementSource) {
-            return
-        }
-        if (this.drawRafPending) {
-            return
-        }
-        this.drawRafPending = true
-        this.rafId = requestAnimationFrame(this.drawLoop)
-    }
-
     /** Start the continuous rAF render loop (runs every vsync). */
     private startDrawLoop() {
         if (this.drawRafPending) return
@@ -417,20 +416,28 @@ export class CanvasRenderer {
                     continue
                 }
 
-                // Store only the latest frame for rAF-paced rendering.
-                // At 120fps decode on a 60Hz display, draw-immediately wastes 2x GPU
-                // budget drawing frames that are overwritten before vsync scans them out.
-                // rAF pacing ensures exactly one draw per display refresh — halves GPU
-                // work and produces perfectly even frame timing.
                 this.mainArrivedCount++
                 const prev = this.latestFrame
                 const prevWasDrawn = this.latestFrameDrawn
                 this.latestFrame = value
                 this.latestFrameDrawn = false
+                this.latestFrameArrivedAt = performance.now()
                 if (prev) {
                     // Previous frame was never drawn — it got superseded
                     if (!prevWasDrawn) this.mainSupersededCount++
                     prev.close()
+                }
+
+                // Draw-on-arrival (input-to-photon latency): the desynchronized
+                // canvas can present out-of-band, so drawing the moment a frame
+                // arrives skips the 0-16.7ms wait for the next rAF tick plus
+                // potentially a compositor vsync. Tradeoffs: frame pacing
+                // follows network arrival (not vsync-even), and at decode rates
+                // above the display refresh every frame is still rasterized
+                // (2x GPU work at 120fps on the 60Hz Tesla panel). The rAF
+                // drawLoop keeps running as a no-op fallback.
+                if (this.drawOnArrival) {
+                    this.drawStoredFrame()
                 }
             }
         } catch (e) {
@@ -439,11 +446,17 @@ export class CanvasRenderer {
         }
     }
 
-    private drawFrameImmediate(frame: VideoFrame) {
-        if (!this.ctx || !this.canvas) {
-            frame.close()
-            return
-        }
+    /**
+     * Draw the stored latestFrame now. Shared by draw-on-arrival (readLoop)
+     * and the rAF fallback loop — whichever runs first wins; the other no-ops
+     * via latestFrameDrawn. Closes the frame eagerly after drawImage (the
+     * canvas has rasterized the pixels; releasing the decoder buffer
+     * immediately reduces GC/decoder-pool pressure).
+     */
+    private drawStoredFrame() {
+        if (!this.ctx || !this.canvas) return
+        const frame = this.latestFrame
+        if (!frame || this.latestFrameDrawn) return
 
         if (this.drawWidth === 0) {
             this.onFirstFrameAfterResize(frame)
@@ -453,13 +466,28 @@ export class CanvasRenderer {
             this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height)
         }
         this.ctx.drawImage(frame, this.offsetX, this.offsetY, this.drawWidth, this.drawHeight)
-        
-        // Eagerly transfer GPU rasterization out of JS memory and close the frame
-        // to massively decrease GC pressure, avoiding the wait for the next frame
-        this.drawnFrameCount++
         this.latestFrameDrawn = true
+        this.drawnFrameCount++
         frame.close()
         this.latestFrame = null
+
+        const now = performance.now()
+        // Arrival→draw latency: ~0ms with draw-on-arrival, 0-16.7ms rAF-paced.
+        // The A/B signal for the drawOnArrival setting, shown in the overlay.
+        const latency = now - this.latestFrameArrivedAt
+        this.drawLatencyAvgMs = this.drawLatencyAvgMs < 0
+            ? latency
+            : this.drawLatencyAvgMs * 0.9 + latency * 0.1
+        if (latency > this.drawLatencyMaxMs) this.drawLatencyMaxMs = latency
+        // Inter-draw gap (jank signal)
+        if (this.lastDrawTime > 0) {
+            const gap = now - this.lastDrawTime
+            if (this.drawGapMin < 0 || gap < this.drawGapMin) this.drawGapMin = gap
+            if (gap > this.drawGapMax) this.drawGapMax = gap
+            this.drawGapAvg = this.drawGapAvg < 0 ? gap : this.drawGapAvg * 0.9 + gap * 0.1
+            if (gap > 25) this.drawJumpCount++
+        }
+        this.lastDrawTime = now
     }
 
     private offsetX = 0;
@@ -471,6 +499,12 @@ export class CanvasRenderer {
     private rafMissedFrames: number = 0;  // rAF ticks with no decoded frame ready (stream not started)
     private drawnFrameCount: number = 0;
     private latestFrameDrawn: boolean = false;  // true once we've drawn the current latestFrame
+    // Draw frames the moment they arrive instead of waiting for the next rAF
+    // tick (main-thread mode only; the worker path always draws on arrival)
+    private drawOnArrival: boolean = true;
+    private latestFrameArrivedAt: number = 0;   // performance.now() when latestFrame was stored
+    private drawLatencyAvgMs: number = -1;      // EMA of arrival→draw latency
+    private drawLatencyMaxMs: number = -1;      // rolling max, reset per diagnostics read
     // Main-thread frame pacing stats
     private mainArrivedCount: number = 0;       // total frames received by readLoop
     private mainSupersededCount: number = 0;    // frames closed without ever being drawn
@@ -540,33 +574,15 @@ export class CanvasRenderer {
         if (!this.ctx || !this.canvas) return
 
         if (!this.latestFrame) {
-            // No frame has ever arrived yet (stream startup)
+            // No undrawn frame pending — either stream startup or (with
+            // drawOnArrival) the frame was already drawn and closed on arrival.
             this.rafMissedFrames++
             return
         }
 
-        // If we already drew this frame, skip — no new content to render.
-        // This happens when display refresh > stream FPS (e.g. 120Hz display, 60fps stream).
-        if (this.latestFrameDrawn) return
-
-        const frame = this.latestFrame
-        this.latestFrameDrawn = true
-        
-        if(this.drawWidth === 0) {
-            this.onFirstFrameAfterResize(frame)
-        }
-
-        // Only clear when there's letterboxing/pillarboxing; full-frame draw overwrites everything
-        if (this.offsetX !== 0 || this.offsetY !== 0) {
-            this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height)
-        }
-        this.ctx.drawImage(frame, this.offsetX, this.offsetY, this.drawWidth, this.drawHeight)
-        this.drawnFrameCount++
-
-        // If a fresher frame arrived while we were drawing, schedule another draw tick.
-        if (!this.latestFrameDrawn) {
-            this.scheduleDraw()
-        }
+        // Fallback draw for a frame that arrived but wasn't drawn on arrival
+        // (drawOnArrival disabled, or ctx wasn't ready at arrival time).
+        this.drawStoredFrame()
     }
 
     destroy() {

@@ -156,7 +156,7 @@ class ViewerApp implements Component {
         if(this.settings.canvasRenderer) {
             this.canvasElement.classList.add("video-stream")
             this.div.appendChild(this.canvasElement)
-            this.canvasRenderer = new CanvasRenderer(this.canvasElement, settings.stretchToFit, settings.useVideoWorker)
+            this.canvasRenderer = new CanvasRenderer(this.canvasElement, settings.stretchToFit, settings.useVideoWorker, settings.drawOnArrival)
             this.videoElement.autoplay = false
         }
 
@@ -332,6 +332,15 @@ class ViewerApp implements Component {
             `canvas=${s.canvasRenderer} videoWorker=${s.useVideoWorker} audioWorker=${s.useAudioWorker} ` +
             `build=${getBuildVersionTag()}`
         )
+        // Full settings dump for remote review — the summary line above only
+        // carries the usual suspects, and every field session so far has had
+        // a "wait, which settings was that?" moment.
+        try {
+            this.stream?.sendClientLogMessage(`[FreezeWatch] settings: ${JSON.stringify(s)}`)
+        } catch {
+            // settings should always be plain JSON-serializable data; a dump
+            // failure must never break the stream
+        }
     }
 
     private focusInput() {

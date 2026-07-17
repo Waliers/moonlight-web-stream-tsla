@@ -23,6 +23,7 @@ export type StreamSettings = {
     jitterBufferMs: number
     dontForceH264: boolean
     videoFec: boolean
+    drawOnArrival: boolean
     canvasRenderer: boolean
     playAudioLocal: boolean
     keepAudioAlive: boolean
@@ -63,6 +64,20 @@ export function defaultStreamSettings(): StreamSettings {
         // round-trip, no freeze, no added latency. Falls back to plain
         // sending automatically if the browser doesn't offer RED/ULPFEC.
         videoFec: true,
+        // Main-thread canvas mode: draw each frame the moment it arrives
+        // instead of waiting for the next rAF tick — saves 0-16.7ms (avg ~8ms)
+        // of arrival→draw queueing on the desynchronized canvas.
+        //
+        // DEFAULT OFF — field-tested on the Tesla over cellular 2026-07-16
+        // and it "stutters all the time": frames arrive with ±5-15ms network
+        // jitter, so arrival-paced draws land irregularly against the fixed
+        // 60Hz scanout (a frame drawn just after scanout waits a full extra
+        // refresh → displayed intervals oscillate 1-2 vsyncs = judder). The
+        // rAF pacing absorbs that jitter invisibly because frames are ready
+        // ahead of their vsync deadline. Perceived smoothness beat the ~8ms
+        // latency win decisively. Only worth enabling on a low-jitter link
+        // (wired LAN).
+        drawOnArrival: false,
         canvasRenderer: true,
         playAudioLocal: false,
         keepAudioAlive: true,
@@ -131,6 +146,7 @@ export class StreamSettingsComponent implements Component {
     private jitterBufferMs: InputComponent
     private forceH264: InputComponent
     private videoFec: InputComponent
+    private drawOnArrival: InputComponent
     private canvasRenderer: InputComponent
 
     private videoSize: SelectComponent
@@ -453,6 +469,14 @@ export class StreamSettingsComponent implements Component {
         this.videoFec.addChangeListener(this.onSettingsChange.bind(this))
         this.videoFec.mount(advancedSection)
 
+        // Draw-on-arrival (low-latency canvas draw)
+        this.drawOnArrival = new InputComponent("drawOnArrival", "checkbox", "Low-latency draw — render frames on arrival instead of next vsync", {
+            defaultValue: defaultSettings.drawOnArrival.toString(),
+            checked: settings?.drawOnArrival ?? defaultSettings.drawOnArrival
+        })
+        this.drawOnArrival.addChangeListener(this.onSettingsChange.bind(this))
+        this.drawOnArrival.mount(advancedSection)
+
         // Use Canvas Renderer
         this.canvasRenderer = new InputComponent("canvasRenderer", "checkbox", "Use Canvas Renderer (Experimental)", {
             defaultValue: defaultSettings.canvasRenderer.toString(),
@@ -624,6 +648,7 @@ export class StreamSettingsComponent implements Component {
         settings.videoSampleQueueSize = parseInt(this.videoSampleQueueSize.getValue())
         settings.dontForceH264 = this.forceH264.isChecked()
         settings.videoFec = this.videoFec.isChecked()
+        settings.drawOnArrival = this.drawOnArrival.isChecked()
         settings.canvasRenderer = this.canvasRenderer.isChecked()
 
         settings.playAudioLocal = this.playAudioLocal.isChecked()

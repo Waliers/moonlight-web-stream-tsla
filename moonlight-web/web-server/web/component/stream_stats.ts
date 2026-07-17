@@ -24,6 +24,9 @@ type WorkerDiagnosticsSnapshot = {
         minGapMs: number
         avgGapMs: number
         maxGapMs: number
+        drawLatencyAvgMs?: number
+        drawLatencyMaxMs?: number
+        drawOnArrival?: boolean
         videoElementMode?: boolean
     } | null
     canvasRendererEnabled: boolean
@@ -517,6 +520,11 @@ export class StreamStatsOverlay implements Component {
                     const gapStr = c.minGapMs >= 0
                         ? `, gaps: ${c.minGapMs.toFixed(1)}/${c.avgGapMs.toFixed(1)}/${c.maxGapMs.toFixed(1)} ms`
                         : ""
+                    // Arrival→draw latency: the A/B readout for the
+                    // draw-on-arrival setting (~0ms on-arrival, ~8ms avg rAF)
+                    const latStr = (c.drawLatencyAvgMs ?? -1) >= 0
+                        ? `, lat: ${c.drawLatencyAvgMs!.toFixed(1)}/${(c.drawLatencyMaxMs ?? -1).toFixed(1)} ms (${c.drawOnArrival ? "on-arrival" : "raf"})`
+                        : ""
                     const srcGapStr = (c as any).srcGapMs ? `, src: ${(c as any).srcGapMs} ms` : ""
                     const supersededStr = c.supersededCount > 0 ? `, skip=${c.supersededCount}` : ""
                     const jumpsStr = c.jumpCount > 0 ? `, jumps=${c.jumpCount}` : ""
@@ -531,7 +539,7 @@ export class StreamStatsOverlay implements Component {
                         arrivedRate = elapsed > 0 ? Math.round((c.arrivedCount - this.prevCanvasArrivedCount) / elapsed) : 0
                         this.prevCanvasArrivedCount = c.arrivedCount
                     }
-                    this.elWorkerVideo.textContent = `mode=${modeLabel}, arrived=${arrivedRate}/s, drawn=${c.drawnFrameCount}, ${dropLabel}=${c.rafMissedFrames}${supersededStr}${jumpsStr}${gapStr}${srcGapStr}, err=${c.error ?? "none"}`
+                    this.elWorkerVideo.textContent = `mode=${modeLabel}, arrived=${arrivedRate}/s, drawn=${c.drawnFrameCount}, ${dropLabel}=${c.rafMissedFrames}${supersededStr}${jumpsStr}${gapStr}${latStr}${srcGapStr}, err=${c.error ?? "none"}`
                 } else {
                     this.elWorkerVideo.textContent = "canvas diagnostics unavailable"
                 }
