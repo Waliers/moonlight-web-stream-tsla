@@ -485,6 +485,11 @@ export class Stream {
                  const state = this.audioContext?.state;
                  console.log(`[AudioContext] state change: ${state}`);
                  this.debugLog(`AudioContext state: ${state}`);
+                 // Server-visible: audio-context suspensions are rare,
+                 // user-audible events (silent stream until recovered), and
+                 // the 2026-07-19 drive showed recovery failing invisibly —
+                 // the retry loop swallowed everything.
+                 this.sendClientLogMessage(`[Audio] context state -> ${state}`)
                  if (state !== 'running') {
                      // Mark interrupted so the next packet resyncs nextAudioTime.
                      // Without this, packets arriving during suspension advance
@@ -501,17 +506,33 @@ export class Stream {
     }
 
     private audioResumeRetryId: ReturnType<typeof setInterval> | null = null;
+    private audioResumeAttempts = 0;
 
     private startAudioResumeRetry() {
         if (this.audioResumeRetryId) return; // already retrying
+        this.audioResumeAttempts = 0;
         this.audioResumeRetryId = setInterval(() => {
             if (!this.audioContext || this.audioContext.state === 'closed') {
                 this.stopAudioResumeRetry();
                 return;
             }
             if (this.audioContext.state === 'running') {
+                this.sendClientLogMessage(
+                    `[Audio] context resumed after ${this.audioResumeAttempts} retr${this.audioResumeAttempts === 1 ? "y" : "ies"}`
+                )
                 this.stopAudioResumeRetry();
                 return;
+            }
+            this.audioResumeAttempts++;
+            // Timer-driven resume() can be rejected OR left pending forever by
+            // autoplay policy (Tesla wants a user gesture once the platform
+            // suspends the context). Success is detected via the state check
+            // above; here we only make prolonged failure visible.
+            if (this.audioResumeAttempts === 10) {
+                this.sendClientLogMessage(
+                    `[Audio] context still ${this.audioContext.state} after 10 resume attempts — ` +
+                    `likely needs a user tap. Is "Keep Audio Context Alive (Tesla Fix)" enabled?`
+                )
             }
             this.audioContext.resume().catch(() => {});
         }, 1000);

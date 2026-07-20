@@ -99,6 +99,13 @@ export class FreezeWatcher {
     private byCause: Record<string, number> = {}
     private lastEvent: FreezeWatchEvent | null = null
 
+    // Self-cost: how much the watcher itself spends per tick. getStats wall
+    // time is mostly off-main-thread browser work; procMs is the main-thread
+    // share (report iteration + classification).
+    private statsWallAvgMs = -1
+    private procAvgMs = -1
+    private procMaxMs = -1
+
     constructor(peerGetter: () => RTCPeerConnection | null) {
         this.peerGetter = peerGetter
         this.rafTick = this.rafTick.bind(this)
@@ -179,6 +186,12 @@ export class FreezeWatcher {
         return `${e.kind} ${Math.round(e.durationMs)} ms, ${e.cause}, ${ageS}s ago`
     }
 
+    /** Watcher self-cost, measured on-device: main-thread processing + getStats wall time per 1s tick. */
+    getSelfCostLine(): string {
+        if (this.procAvgMs < 0) return "—"
+        return `proc ${this.procAvgMs.toFixed(2)} ms (max ${this.procMaxMs.toFixed(2)}), getStats ${this.statsWallAvgMs.toFixed(1)} ms wall @1Hz`
+    }
+
     // -- rAF heartbeat: detects main-thread / compositor stalls ---------------
 
     private rafTick(now: number) {
@@ -197,12 +210,26 @@ export class FreezeWatcher {
 
             if (gap >= RENDER_STALL_MS && now - this.lastRenderStallReportAt >= RENDER_STALL_REPORT_COOLDOWN_MS) {
                 this.lastRenderStallReportAt = now
+                // The Tesla browser's main thread reliably freezes for the
+                // duration of a radio outage (observed 3.3s/4.5s/16.3s rAF
+                // gaps, each exactly spanning ICE disconnected→connected).
+                // That's platform behavior during modem recovery, not a
+                // renderer problem — label it separately so it doesn't
+                // pollute the main-thread-stall statistics.
+                const peerState = this.peerGetter()?.connectionState
+                const duringOutage = peerState === "disconnected" || peerState === "failed" || peerState === "connecting"
+                // Peer state is ALWAYS included: ICE takes seconds to notice a
+                // dead radio, so a stall at outage ONSET can still read
+                // "connected" and be labeled main-thread-stall — the log
+                // reader needs the state to correlate with the streamer's ICE
+                // lines (2026-07-19 session: 3.9s "main-thread-stall" 14s
+                // before ICE reported disconnected).
                 this.emitEvent({
                     atMs: now - this.startedAt,
                     kind: "render-stall",
                     durationMs: gap,
-                    cause: "main-thread-stall",
-                    detail: `rAF gap ${gap.toFixed(0)} ms`,
+                    cause: duringOutage ? "outage-stall" : "main-thread-stall",
+                    detail: `rAF gap ${gap.toFixed(0)} ms (peer ${peerState ?? "?"})`,
                 })
             }
         }
@@ -222,14 +249,22 @@ export class FreezeWatcher {
 
         this.statsInFlight = true
         let stats: RTCStatsReport
+        const wallStart = performance.now()
         try {
-            stats = await peer.getStats()
+            // Scope to the video receiver where possible — its report is a
+            // fraction of the full peer dump (no ICE/certificate/data-channel
+            // entries), so both gathering and iteration are cheaper.
+            const receiver = peer.getReceivers?.().find((r) => r.track?.kind === "video")
+            stats = await (receiver ? receiver.getStats() : peer.getStats())
         } catch {
             this.statsInFlight = false
             return
         }
         this.statsInFlight = false
         if (!this.running) return
+        const wallMs = performance.now() - wallStart
+        this.statsWallAvgMs = this.statsWallAvgMs < 0 ? wallMs : this.statsWallAvgMs * 0.9 + wallMs * 0.1
+        const procStart = performance.now()
 
         let sample: StatsSample | null = null
         stats.forEach((report: any) => {
@@ -331,11 +366,14 @@ export class FreezeWatcher {
                 cause = "nack-recovery"
             } else if (keyDelta > 0) {
                 // A keyframe arrived that the browser never asked for (no
-                // PLI, no loss on the WebRTC leg): the Sunshine→streamer leg
-                // dropped a frame and moonlight-common requested recovery.
-                // Matches streamer-side "Network dropped 1 frame" log lines
-                // (Tesla field 2026-07-16). Remedy is host-side: RFI
-                // capability shortens these to a single-frame gap.
+                // PLI, no loss on the WebRTC leg): the HOST dropped a frame
+                // and moonlight-common requested recovery. Root-caused
+                // 2026-07-17: every streamer-side "Network dropped 1 frame
+                // (frame N)" matched an "NvEnc: frame N encode wait timeout"
+                // in sunshine.log — the game saturates the GPU and NVENC
+                // misses its deadline; nothing is lost in transit. Remedy is
+                // host GPU headroom (cap the game's framerate); RFI shortens
+                // the recovery.
                 cause = "host-frame-drop"
             } else if (rxDropped) {
                 cause = "receive-gap" // sender/encoder produced no frames — host-side or uplink stall
@@ -359,14 +397,18 @@ export class FreezeWatcher {
             if (rafGapMs >= 200) flags.push(`rafGap=${rafGapMs.toFixed(0)}ms`)
             if (underrunDelta > 0) flags.push(`audioUnderruns=+${underrunDelta}`)
 
+            // Deltas can go negative (Chromium revises packetsLost downward
+            // when a "lost" packet turns up late) — print a proper sign
+            // instead of the earlier "lost=+-1".
+            const signed = (n: number) => (n < 0 ? `${n}` : `+${n}`)
             const detail =
-                `lost=+${lostDelta} nack=+${nackDelta} pli=+${pliDelta} keyframes=+${keyDelta}` +
+                `lost=${signed(lostDelta)} nack=${signed(nackDelta)} pli=${signed(pliDelta)} keyframes=${signed(keyDelta)}` +
                 ` rx=${rxRate.toFixed(0)}/s(avg ${this.emaFrameRate.toFixed(0)})` +
-                ` dropped=+${cur.framesDropped - prev.framesDropped}` +
+                ` dropped=${signed(cur.framesDropped - prev.framesDropped)}` +
                 ` decode=${decodeMsPerFrame.toFixed(1)}ms(avg ${this.emaDecodeMsPerFrame.toFixed(1)})` +
                 ` jb=${jbAvgMs.toFixed(1)}ms(avg ${this.emaJbDelayMs.toFixed(1)})` +
                 ` jitter=${(cur.jitter * 1000).toFixed(0)}ms` +
-                ` fecRx=+${cur.fecPacketsReceived - prev.fecPacketsReceived}` +
+                ` fecRx=${signed(cur.fecPacketsReceived - prev.fecPacketsReceived)}` +
                 (flags.length > 0 ? ` ${flags.join(" ")}` : "")
 
             this.totalFreezeMs += freezeMs
@@ -394,6 +436,10 @@ export class FreezeWatcher {
                 ? jbAvgMs
                 : this.emaJbDelayMs * 0.8 + jbAvgMs * 0.2
         }
+
+        const procMs = performance.now() - procStart
+        this.procAvgMs = this.procAvgMs < 0 ? procMs : this.procAvgMs * 0.9 + procMs * 0.1
+        if (procMs > this.procMaxMs) this.procMaxMs = procMs
     }
 
     private emitEvent(event: FreezeWatchEvent) {

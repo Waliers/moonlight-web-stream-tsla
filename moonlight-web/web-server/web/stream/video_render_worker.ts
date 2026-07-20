@@ -61,13 +61,25 @@ async function readStreamLoop(reader: ReadableStreamDefaultReader<VideoFrame>) {
     }
 }
 
-// === Draw-immediately strategy ===
-// On a 60Hz display the compositor picks up the latest canvas content at vsync
-// regardless of how many drawImage calls happened. Drawing immediately on frame
-// arrival ensures zero added latency and zero drift. At 60fps stream on 60Hz
-// display this is exactly 1 draw per vsync.
+// === Vsync-paced draw strategy ===
+// Previously this drew immediately on frame arrival, on the theory that at a
+// steady 60fps stream on a 60Hz display that's equivalent to 1 draw per
+// vsync. REJECTED 2026-07-20: field-tested as frequent micro-stutter despite
+// measuring near-perfect gaps (16.0/16.7/18.0ms) with zero freezes reported —
+// the same mechanism as the main-thread draw-on-arrival experiment (see
+// project memory: draw-on-arrival-latency), just not yet caught here. Drawing
+// the instant a frame arrives assumes network arrival is phase-aligned with
+// the display's actual vsync; under real jitter it isn't, and our own gap
+// stat (time between JS draw calls) can't see the mismatch between when we
+// drew and when the compositor actually presented. Now: store the latest
+// frame and draw at most once per vsync via requestAnimationFrame, exactly
+// mirroring the main thread's readLoop/drawLoop split.
 
-let lastDrawnTimestamp: number = -1
+let latestFrame: VideoFrame | null = null
+let latestFrameDrawn = true  // no frame pending initially
+let rafId = 0
+let rafRunning = false
+let lastArrivedTimestamp: number = -1
 let workerDrawn = 0
 let workerDropped = 0
 
@@ -89,8 +101,6 @@ let srcGapMax = -Infinity
 let srcGapSum = 0
 let srcGapCount = 0
 
-function clearPresentationQueue() { /* no queue — draw immediately */ }
-
 function scheduleFrame(frame: VideoFrame) {
     // Track inter-frame arrival gap (only when stats enabled)
     if (statsEnabled) {
@@ -109,7 +119,7 @@ function scheduleFrame(frame: VideoFrame) {
     }
 
     // Monotonic guard — discard exact duplicate timestamps only
-    if (frame.timestamp === lastDrawnTimestamp) {
+    if (frame.timestamp === lastArrivedTimestamp) {
         frame.close()
         workerDropped++
         return
@@ -124,10 +134,46 @@ function scheduleFrame(frame: VideoFrame) {
         srcGapCount++
     }
     lastFrameTimestamp = frame.timestamp
+    lastArrivedTimestamp = frame.timestamp
 
-    lastDrawnTimestamp = frame.timestamp
+    // Store as latest — the rAF loop below draws it, at most once per vsync.
+    const prev = latestFrame
+    latestFrame = frame
+    latestFrameDrawn = false
+    if (prev) {
+        // A newer frame arrived before the rAF loop drew this one — superseded.
+        prev.close()
+        workerDropped++
+    }
+}
+
+function rafDrawTick() {
+    rafId = workerSelf.requestAnimationFrame(rafDrawTick)
+    if (!latestFrame || latestFrameDrawn) return
+    const frame = latestFrame
+    latestFrameDrawn = true
+    latestFrame = null
     drawFrame(frame)  // calls frame.close() — decoder buffer released immediately
     workerDrawn++
+}
+
+function startRafLoop() {
+    if (rafRunning) return
+    rafRunning = true
+    rafId = workerSelf.requestAnimationFrame(rafDrawTick)
+}
+
+function stopRafLoop() {
+    rafRunning = false
+    if (rafId && typeof workerSelf.cancelAnimationFrame === "function") {
+        workerSelf.cancelAnimationFrame(rafId)
+    }
+    rafId = 0
+    if (latestFrame) {
+        latestFrame.close()
+        latestFrame = null
+    }
+    latestFrameDrawn = true
 }
 
 // Reusable stats message — avoids allocation each interval
@@ -257,6 +303,7 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
             useBitmapRenderer = false
             ctx = canvas.getContext("2d", { alpha: false, desynchronized: true })
         }
+        startRafLoop()
         return
     }
 
@@ -284,7 +331,7 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
             activeStreamReader = null
             old.cancel().catch(() => {})
         }
-        lastDrawnTimestamp = -1
+        lastArrivedTimestamp = -1
         lastArrivalMs = -1
         activeStreamReader = data.stream.getReader()
         readStreamLoop(activeStreamReader)
@@ -306,7 +353,8 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
 
     if (data.type === "stop") {
         if (activeStreamReader) { activeStreamReader.cancel().catch(() => {}); activeStreamReader = null }
-        lastDrawnTimestamp = -1
+        stopRafLoop()
+        lastArrivedTimestamp = -1
         canvas = null
         ctx = null
     }

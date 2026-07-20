@@ -466,10 +466,13 @@ impl VideoDecoder for TrackSampleVideoDecoder {
 
     fn capabilities(&self) -> Capabilities {
         // Reference Frame Invalidation for H264. Tesla field sessions
-        // (2026-07-16) showed ~1 frame per minute lost on the
-        // Sunshine→streamer LOOPBACK leg ("Network dropped 1 frame" — host
-        // under game+encode load), each costing a ~300-600ms freeze because
-        // recovery fell back to a full IDR round trip. With RFI declared,
+        // (2026-07-16) showed ~1 frame per minute skipped by the HOST
+        // ("Network dropped 1 frame (frame N)" — root-caused 2026-07-17:
+        // every one matched an "NvEnc: frame N encode wait timeout" in
+        // sunshine.log, i.e. the game saturates the GPU and the encoder
+        // misses its deadline; nothing is lost in transit), each costing a
+        // ~300-600ms freeze because recovery fell back to a full IDR round
+        // trip. With RFI declared,
         // moonlight-common instead asks Sunshine to encode the next frame
         // referencing a pre-loss frame: a normal-sized P-frame, single-frame
         // gap, no IDR burst. The browser's copies of those references are

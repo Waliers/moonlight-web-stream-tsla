@@ -49,11 +49,13 @@ export function defaultStreamSettings(): StreamSettings {
         bitrate: 4000,
         packetSize: 1024,
         fps: 60,
-        // 40ms is a deliberate FEEL choice, not a smoothness optimum — see the
-        // Gaming (Balanced) preset comment for the measured 40-vs-80 tradeoff.
-        jitterBufferMs: 40,
+        // 10ms field-validated 2026-07-20 with useVideoWorker on (see below) —
+        // lower than the old 40ms because the vsync-paced worker render path
+        // no longer needs buffer margin to compensate for its own uneven
+        // pacing; see the Gaming (Balanced) preset comment for the full story.
+        jitterBufferMs: 10,
         videoSampleQueueSize: 1,
-        videoSize: "1080p",
+        videoSize: "720p",
         videoSizeCustom: {
             width: 960,
             height: 540,
@@ -92,7 +94,11 @@ export function defaultStreamSettings(): StreamSettings {
         stretchToFit: true,
         showStreamStats: false,
         useAudioWorker: true,
-        useVideoWorker: false,
+        // ON by default since 2026-07-20 — see the Gaming (Balanced) preset
+        // comment for the full story (the worker's draw-on-arrival bug that
+        // caused felt micro-stutter despite pristine gap numbers is fixed;
+        // it now measures AND feels smoother than the main-thread path).
+        useVideoWorker: true,
     }
 }
 
@@ -207,18 +213,16 @@ export class StreamSettingsComponent implements Component {
         const presets: Array<{ label: string, desc: string, values: Partial<StreamSettings> }> = [
             {
                 label: "🎬 Video / Streaming",
-                desc: "1080p 30fps 3 Mbps, 150ms buffer — smooth playback over cellular",
-                values: { videoSize: "1080p", fps: 30, bitrate: 3000, jitterBufferMs: 150 }
+                desc: "1080p 30fps 3 Mbps, 150ms buffer, video worker — smooth playback over cellular",
+                values: { videoSize: "1080p", fps: 30, bitrate: 3000, jitterBufferMs: 150, useVideoWorker: true }
             },
             // Video render worker tradeoff (measured in the field): the worker
             // reads frames on its own thread and delivers a metronomic 60Hz
-            // cadence (16.0-17.0ms gaps → visibly less micro-stutter), but its
-            // bitmaprenderer path goes through createImageBitmap + the normal
-            // compositor queue, adding ~1-2 vsyncs of latency. The main-thread
-            // path uses a desynchronized 2D canvas (can bypass compositing →
-            // lower input lag) at the cost of uneven frame pacing when the
-            // main thread is busy. So: Balanced = smoothness = worker ON,
-            // Performance = lowest input lag = worker OFF.
+            // cadence (16.0-17.0ms gaps → visibly less micro-stutter). It used
+            // to also cost ~1-2 vsyncs of latency vs. the main-thread
+            // desynchronized-2D-canvas path — see the 2026-07-20 update below
+            // for why that's no longer the deciding factor. All presets now
+            // use the worker; see that update for the full reasoning.
             // Gaming bitrate is capped at 4 Mbps by the TESLA BROWSER's CPU
             // budget, not the network: A/B-measured 2026-07-07, ~6.3 Mbps
             // actual caused regular ~270ms whole-renderer stalls (freezes +
@@ -228,10 +232,13 @@ export class StreamSettingsComponent implements Component {
             // 1080p60. Raise only with field evidence. For more quality per
             // packet, enable the browser-codec toggle (H265 hardware decode).
             //
-            // 60fps, not 120: requesting 120fps made the game render uncapped,
-            // saturating the host GPU (encoder collapsed to ~46fps with ragged
-            // pacing → freezes, PLI/IDR storms). 60fps maps 1:1 onto the
-            // Tesla's 60Hz display.
+            // 60fps vs 120: the July 120fps attempt failed because the game
+            // rendered uncapped and starved the encoder (collapsed to ~46fps →
+            // freezes, PLI/IDR storms). Re-measured 2026-07-16 post-FEC/RFI:
+            // 1080p120@12Mbps ingested cleanly (114/s decoded, 1-2ms decode,
+            // one 167ms blip in 100s) — see the 120fps preset below. 60fps
+            // remains the safe default; 120 requires the game itself to hold
+            // 120fps (use an in-game/driver frame cap, NOT uncapped).
             // jitterBufferMs is the freeze-vs-feel dial, A/B-measured on the
             // Tesla over cellular 2026-07-15 (RTT 38-47ms):
             //   80ms → ZERO freezes in a 9-minute session, but input-to-photon
@@ -243,22 +250,58 @@ export class StreamSettingsComponent implements Component {
             //   40ms → best feel; accepts a few ~200-300ms freezes per session
             //          when a NACK retransmit (needs ≳ RTT + ~20ms) or a radio
             //          micro-outage outruns the buffer.
-            // 40 is the chosen gaming point. Raise toward 80-150 only for
-            // watch-mostly use (that's what the Streaming preset is for).
+            // UPDATED 2026-07-20: the worker's "adds ~1-2 vsyncs of latency"
+            // tradeoff above was true when it drew every frame the instant it
+            // arrived (draw-on-arrival) — measured great gap numbers but felt
+            // like frequent micro-stutter, because arrival timing isn't
+            // phase-aligned with the display's actual vsync (same mechanism
+            // as the drawOnArrival rejection above, just on the worker
+            // thread, not caught until now). Fixed: the worker now paces
+            // draws through its own requestAnimationFrame loop, same as the
+            // main thread. Field-confirmed same day: gaps rock-solid at
+            // 16.0/16.7/18.0ms AND "stutters felt less" — the first config to
+            // beat the main-thread path on both smoothness metrics and feel,
+            // not just one. 720p (down from 1080p) and 10ms buffer (down from
+            // 40ms) both field-validated in the same sessions — the lower
+            // buffer works now because the render path itself no longer adds
+            // its own unevenness for the buffer to compensate for. Given
+            // that, every preset below now turns the worker on — the old
+            // "Performance = worker OFF for lowest input lag" split assumed
+            // the pre-fix latency tradeoff still applied. That tradeoff was
+            // never re-measured post-fix for the 120fps/Performance tiers
+            // specifically (only Balanced-tier settings got full field
+            // validation this session) — if either ever feels laggier than
+            // before, that's the first thing to re-check.
             {
                 label: "🎮 Gaming (Balanced)",
-                desc: "1080p 60fps 4 Mbps, 40ms buffer, direct render — smooth pacing, good responsiveness",
-                values: { videoSize: "1080p", fps: 60, bitrate: 4000, jitterBufferMs: 40, useVideoWorker: false }
+                desc: "720p 60fps 4 Mbps, 10ms buffer, video worker — smooth pacing, good responsiveness",
+                values: { videoSize: "720p", fps: 60, bitrate: 4000, jitterBufferMs: 10, useVideoWorker: true }
+            },
+            // 120fps capture: the pacing-safe latency lever. Halves game frame
+            // time + capture wait, and the vsync-paced draw picks the freshest
+            // decoded frame each 60Hz tick (frame age ~4ms instead of ~8ms) —
+            // ~10-15ms less input-to-photon overall, with displayed pacing
+            // still vsync-even. Costs: ~2x packet rate (~1100/s + FEC parity —
+            // ingest held up in the 2026-07-16 field test), 12 Mbps to keep
+            // bits/frame at least at Balanced level, and the HOST must
+            // actually sustain 120fps game + encode (cap the game's framerate;
+            // an uncapped game starving the encoder is how the July attempt
+            // failed). FreezeWatch will attribute it if the host can't keep up
+            // (receive-gap) or the link can't (nack-recovery/link-stall).
+            {
+                label: "🎮 Gaming (120fps)",
+                desc: "1080p 120fps 12 Mbps, 40ms buffer, video worker — lowest latency, needs host to hold 120fps",
+                values: { videoSize: "1080p", fps: 120, bitrate: 12000, jitterBufferMs: 40, useVideoWorker: true }
             },
             {
                 label: "🎮 Gaming (Performance)",
-                desc: "1080p 60fps 8 Mbps, no buffer, direct render — lowest input lag",
-                values: { videoSize: "1080p", fps: 60, bitrate: 8000, jitterBufferMs: 0, useVideoWorker: false }
+                desc: "1080p 60fps 8 Mbps, no buffer, video worker — lowest input lag",
+                values: { videoSize: "1080p", fps: 60, bitrate: 8000, jitterBufferMs: 0, useVideoWorker: true }
             },
             {
                 label: "📱 Low Bandwidth",
-                desc: "720p 30fps 1.5 Mbps, 100ms buffer — minimal data usage",
-                values: { videoSize: "720p", fps: 30, bitrate: 1500, jitterBufferMs: 100 }
+                desc: "720p 30fps 1.5 Mbps, 100ms buffer, video worker — minimal data usage",
+                values: { videoSize: "720p", fps: 30, bitrate: 1500, jitterBufferMs: 100, useVideoWorker: true }
             },
         ]
 

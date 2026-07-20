@@ -6,6 +6,17 @@ declare class MediaStreamTrackProcessor {
 export class CanvasRenderer {
     canvas: HTMLCanvasElement | null
     ctx: CanvasRenderingContext2D | null
+    // Preferred main-thread path — see startRendering(). Plain 2D context
+    // (ctx) is capped at ~30fps on some Chromium builds (Tesla, Android
+    // Chrome, and desktop Chrome have all reproduced it — not a performance
+    // issue, a compositing behavior specific to 2D canvas fed by VideoFrame).
+    bitmapCtx: ImageBitmapRenderingContext | null
+    // Set once transferControlToOffscreen() has been called on canvas (see
+    // startRendering()). After that call, canvas.width/height can no longer
+    // be assigned directly (throws InvalidStateError) — resizing must go
+    // through this object instead. canvas.clientWidth/clientHeight (CSS
+    // layout size) remain safe to read either way.
+    private offscreenCanvas: OffscreenCanvas | null
     videoTrack: MediaStreamTrack | null
     trackProcessor: MediaStreamTrackProcessor | null
     readableStream: ReadableStream | null
@@ -32,6 +43,8 @@ export class CanvasRenderer {
     constructor(canvasElement: HTMLCanvasElement, stretchToFit: boolean, enableWorkerAcceleration: boolean = true, drawOnArrival: boolean = true) {
         this.canvas = canvasElement
         this.ctx = null
+        this.bitmapCtx = null
+        this.offscreenCanvas = null
         this.videoTrack = null
         this.trackProcessor = null
         this.readableStream = null
@@ -67,10 +80,11 @@ export class CanvasRenderer {
             }
 
             if (this.stretchToFit) {
-                this.canvas.width = this.canvas.clientWidth
-                this.canvas.height = this.canvas.clientHeight
-                this.drawWidth = this.canvas.width
-                this.drawHeight = this.canvas.height
+                const w = this.canvas.clientWidth
+                const h = this.canvas.clientHeight
+                this.resizeDrawTarget(w, h)
+                this.drawWidth = w
+                this.drawHeight = h
                 this.offsetX = 0
                 this.offsetY = 0
             } else {
@@ -119,6 +133,9 @@ export class CanvasRenderer {
                 width: Math.max(1, this.canvas.clientWidth),
                 height: Math.max(1, this.canvas.clientHeight),
             }, [offscreen as any])
+            if (this.statsEnabledDesired) {
+                this.renderWorker.postMessage({ type: 'enable-stats' })
+            }
             this.workerRenderingEnabled = true
             this.workerInitError = null
         } catch (e) {
@@ -173,6 +190,7 @@ export class CanvasRenderer {
             drawLatencyAvgMs: isWorkerActive || isVideoElementActive ? -1 : mainDrawLatencyAvg,
             drawLatencyMaxMs: isWorkerActive || isVideoElementActive ? -1 : mainDrawLatencyMax,
             drawOnArrival:   this.drawOnArrival,
+            usingBitmapRenderer: this.bitmapCtx != null,
             videoElementMode: isVideoElementActive,
         }
     }
@@ -335,8 +353,49 @@ export class CanvasRenderer {
     startRendering() {
         if ((this.readableStream || this.frameReader) && !this.isRunning) {
             this.trySetupRenderWorker()
-            if (!this.workerRenderingEnabled && this.canvas && !this.ctx) {
-                this.ctx = this.canvas.getContext("2d", { alpha: false, desynchronized: true })
+            if (!this.workerRenderingEnabled && this.canvas && !this.ctx && !this.bitmapCtx) {
+                // Prefer an OffscreenCanvas even on the main thread. Plain
+                // bitmaprenderer on a regular HTMLCanvasElement still caps at
+                // ~30fps (measured 2026-07-20) — cross-platform (Tesla,
+                // Android Chrome, desktop Chrome), so it isn't a performance
+                // issue or specifically a 2D-vs-bitmaprenderer context issue.
+                // The worker path's fix is more likely OffscreenCanvas's own
+                // presentation path bypassing whatever compositor behavior
+                // causes the cap, independent of context type or thread.
+                // transferControlToOffscreen() works from the main thread —
+                // this gets the same fix without a Worker's message-passing
+                // overhead (which had its own reported stutter). A canvas can
+                // only ever be bound to one context/offscreen for its
+                // lifetime, so this must happen before any getContext() call
+                // succeeds, and it can only be attempted once ever.
+                let offscreenBitmapCtx: ImageBitmapRenderingContext | null = null
+                const transfer = (this.canvas as any).transferControlToOffscreen
+                if (typeof transfer === "function") {
+                    try {
+                        const offscreen = transfer.call(this.canvas) as OffscreenCanvas
+                        offscreen.width = this.canvas.width
+                        offscreen.height = this.canvas.height
+                        offscreenBitmapCtx = offscreen.getContext("bitmaprenderer", { alpha: false }) as ImageBitmapRenderingContext | null
+                        if (offscreenBitmapCtx) {
+                            this.offscreenCanvas = offscreen
+                        } else {
+                            // bitmaprenderer unavailable on this OffscreenCanvas (very
+                            // unlikely on any real target browser) — 2D on an already-
+                            // transferred canvas so no meaningful fallback remains
+                            // beyond accepting the known ~30fps cap.
+                            this.offscreenCanvas = offscreen
+                            this.ctx = offscreen.getContext("2d", { alpha: false, desynchronized: true }) as unknown as CanvasRenderingContext2D
+                        }
+                    } catch (_e) {
+                        // transferControlToOffscreen unsupported or already called —
+                        // fall through to the regular (non-offscreen) canvas below.
+                    }
+                }
+                if (offscreenBitmapCtx) {
+                    this.bitmapCtx = offscreenBitmapCtx
+                } else if (!this.ctx) {
+                    this.ctx = this.canvas.getContext("2d", { alpha: false, desynchronized: true })
+                }
             }
             this.isRunning = true
             if (this.workerRenderingEnabled && this.tryTransferStreamToWorker()) {
@@ -449,18 +508,34 @@ export class CanvasRenderer {
     /**
      * Draw the stored latestFrame now. Shared by draw-on-arrival (readLoop)
      * and the rAF fallback loop — whichever runs first wins; the other no-ops
-     * via latestFrameDrawn. Closes the frame eagerly after drawImage (the
-     * canvas has rasterized the pixels; releasing the decoder buffer
-     * immediately reduces GC/decoder-pool pressure).
+     * via latestFrameDrawn. Dispatches to whichever context type this canvas
+     * was bound to (see startRendering()).
      */
     private drawStoredFrame() {
-        if (!this.ctx || !this.canvas) return
+        if (!this.canvas) return
         const frame = this.latestFrame
         if (!frame || this.latestFrameDrawn) return
 
         if (this.drawWidth === 0) {
             this.onFirstFrameAfterResize(frame)
         }
+
+        if (this.bitmapCtx) {
+            this.drawStoredFrameBitmap(frame)
+        } else if (this.ctx) {
+            this.drawStoredFrame2d(frame)
+        }
+    }
+
+    /**
+     * Fallback path when bitmaprenderer isn't supported: synchronous
+     * ctx.drawImage(). Closes the frame eagerly after drawing (the canvas has
+     * rasterized the pixels; releasing the decoder buffer immediately reduces
+     * GC/decoder-pool pressure).
+     */
+    private drawStoredFrame2d(frame: VideoFrame) {
+        if (!this.ctx || !this.canvas) return
+        const arrivedAt = this.latestFrameArrivedAt
 
         if (this.offsetX !== 0 || this.offsetY !== 0) {
             this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height)
@@ -470,11 +545,86 @@ export class CanvasRenderer {
         this.drawnFrameCount++
         frame.close()
         this.latestFrame = null
+        this.recordDrawCompletion(arrivedAt)
+    }
 
+    // At most one createImageBitmap()+transferFromImageBitmap() in flight at a
+    // time (see drawStoredFrameBitmap doc comment for why).
+    private bitmapDrawInFlight: boolean = false
+
+    /**
+     * Default main-thread path: createImageBitmap() + transferFromImageBitmap()
+     * instead of a synchronous drawImage(). Mirrors the technique already
+     * proven in video_render_worker.ts's worker render path (atomic compositor
+     * handoff instead of a blocking paint) — this is what actually fixes the
+     * ~30fps 2D-canvas compositing cap (confirmed cross-platform: Tesla,
+     * Android Chrome, desktop Chrome laptop — not a performance issue).
+     *
+     * Concurrency is capped at 1 in-flight bitmap operation. A first attempt
+     * at this (2026-07-20) let createImageBitmap calls for consecutive frames
+     * overlap freely — harmless on the worker thread (nothing else competes
+     * for its event loop) but on the main thread, if other work (input
+     * handling, FreezeWatch, stats) delays when a pending promise's .then()
+     * actually runs, frames stay unclosed longer than intended and the
+     * decoder's frame pool can exhaust, stalling the whole pipeline (observed:
+     * hard stall after ~20 frames). Bounding to 1 in-flight call means a frame
+     * is always closed (via .finally()) before the next one starts; any frame
+     * that arrives while one is already in flight is simply left as
+     * latestFrame and picked up either by the retry below or the next caller
+     * — never captured by a second concurrent createImageBitmap call.
+     *
+     * Known limitation (matches the worker path): no offsetX/offsetY
+     * compositing — transferFromImageBitmap always fills the whole canvas, so
+     * letterbox/pillarbox positioning isn't applied here. Fine under the
+     * default stretchToFit=true where offsets are always 0.
+     */
+    private drawStoredFrameBitmap(frame: VideoFrame) {
+        if (!this.bitmapCtx) {
+            frame.close()
+            return
+        }
+        if (this.bitmapDrawInFlight) {
+            // Leave latestFrame/latestFrameDrawn alone — whichever frame is
+            // current once the in-flight draw finishes gets picked up by the
+            // retry in .finally() below (or the next rAF/readLoop call).
+            return
+        }
+        const arrivedAt = this.latestFrameArrivedAt
+        this.latestFrameDrawn = true
+        this.drawnFrameCount++
+        this.latestFrame = null
+        this.bitmapDrawInFlight = true
+
+        // No Promise.finally in the ES6 target — duplicate the in-flight
+        // clear + retry in both branches instead.
+        const settle = () => {
+            this.bitmapDrawInFlight = false
+            // Don't wait for the next rAF tick (up to 16.7ms away) to pick up
+            // a frame that arrived while this one was in flight.
+            this.drawStoredFrame()
+        }
+        createImageBitmap(frame, {
+            resizeWidth: this.drawWidth,
+            resizeHeight: this.drawHeight,
+            resizeQuality: "low",
+        }).then((bitmap) => {
+            this.bitmapCtx?.transferFromImageBitmap(bitmap)
+            bitmap.close()
+            frame.close()
+            this.recordDrawCompletion(arrivedAt)
+            settle()
+        }).catch(() => {
+            frame.close()
+            settle()
+        })
+    }
+
+    /** Arrival→draw latency + inter-draw gap bookkeeping. */
+    private recordDrawCompletion(arrivedAt: number) {
         const now = performance.now()
         // Arrival→draw latency: ~0ms with draw-on-arrival, 0-16.7ms rAF-paced.
         // The A/B signal for the drawOnArrival setting, shown in the overlay.
-        const latency = now - this.latestFrameArrivedAt
+        const latency = now - arrivedAt
         this.drawLatencyAvgMs = this.drawLatencyAvgMs < 0
             ? latency
             : this.drawLatencyAvgMs * 0.9 + latency * 0.1
@@ -485,7 +635,11 @@ export class CanvasRenderer {
             if (this.drawGapMin < 0 || gap < this.drawGapMin) this.drawGapMin = gap
             if (gap > this.drawGapMax) this.drawGapMax = gap
             this.drawGapAvg = this.drawGapAvg < 0 ? gap : this.drawGapAvg * 0.9 + gap * 0.1
-            if (gap > 25) this.drawJumpCount++
+            // "Jump" = gap well above the observed cadence. A fixed 25ms
+            // threshold flagged every normal 40ms gap on 25/30fps content
+            // (2026-07-17 field dump: jumps=49 in one 2s window at 25fps).
+            const jumpThreshold = this.drawGapAvg > 0 ? Math.max(25, this.drawGapAvg * 1.75) : 25
+            if (gap > jumpThreshold) this.drawJumpCount++
         }
         this.lastDrawTime = now
     }
@@ -520,10 +674,32 @@ export class CanvasRenderer {
     private workerMinGapMs: number = -1;
     private workerAvgGapMs: number = -1;
     private workerMaxGapMs: number = -1;
+    // Last state requested via setStatsEnabled(), replayed once the worker
+    // actually exists — the stats overlay's initial show() typically fires
+    // before startRendering() has created renderWorker, so a plain postMessage
+    // here would silently no-op and stats would never turn on for worker mode.
+    private statsEnabledDesired: boolean = false;
 
     setStatsEnabled(enabled: boolean) {
+        this.statsEnabledDesired = enabled
         if (this.renderWorker) {
             this.renderWorker.postMessage({ type: enabled ? 'enable-stats' : 'disable-stats' })
+        }
+    }
+
+    /**
+     * Sets the draw-buffer size. Once transferControlToOffscreen() has been
+     * called, canvas.width/height can no longer be assigned (throws
+     * InvalidStateError) — the OffscreenCanvas object must be resized
+     * instead. Falls back to the regular canvas when no transfer happened.
+     */
+    private resizeDrawTarget(width: number, height: number) {
+        if (this.offscreenCanvas) {
+            this.offscreenCanvas.width = width
+            this.offscreenCanvas.height = height
+        } else if (this.canvas) {
+            this.canvas.width = width
+            this.canvas.height = height
         }
     }
 
@@ -538,26 +714,28 @@ export class CanvasRenderer {
         this.offsetY = 0
 
         if (this.stretchToFit) {
-            this.canvas.width = this.canvas.clientWidth
-            this.canvas.height = this.canvas.clientHeight
-            this.drawWidth = this.canvas.width
-            this.drawHeight = this.canvas.height
+            const w = this.canvas.clientWidth
+            const h = this.canvas.clientHeight
+            this.resizeDrawTarget(w, h)
+            this.drawWidth = w
+            this.drawHeight = h
             this.offsetX = 0
             this.offsetY = 0
         } else {
-            this.canvas.width = frame.displayWidth
-            this.canvas.height = frame.displayHeight
+            const w = frame.displayWidth
+            const h = frame.displayHeight
+            this.resizeDrawTarget(w, h)
 
             if (canvasAspect > frameAspect) {
                 // Canvas is wider than the video frame, so the video will be pillarboxed.
-                this.drawHeight = this.canvas.height
+                this.drawHeight = h
                 this.drawWidth = this.drawHeight * frameAspect
-                this.offsetX = (this.canvas.width - this.drawWidth) / 2
+                this.offsetX = (w - this.drawWidth) / 2
             } else {
                 // Canvas is taller than the video frame, so the video will be letterboxed.
-                this.drawWidth = this.canvas.width
+                this.drawWidth = w
                 this.drawHeight = this.drawWidth / frameAspect
-                this.offsetY = (this.canvas.height - this.drawHeight) / 2
+                this.offsetY = (h - this.drawHeight) / 2
             }
         }
     }
@@ -571,7 +749,7 @@ export class CanvasRenderer {
         this.drawRafPending = true
         this.rafId = requestAnimationFrame(this.drawLoop)
 
-        if (!this.ctx || !this.canvas) return
+        if ((!this.ctx && !this.bitmapCtx) || !this.canvas) return
 
         if (!this.latestFrame) {
             // No undrawn frame pending — either stream startup or (with
@@ -604,5 +782,7 @@ export class CanvasRenderer {
         }
         this.canvas = null
         this.ctx = null
+        this.bitmapCtx = null
+        this.offscreenCanvas = null
     }
 }

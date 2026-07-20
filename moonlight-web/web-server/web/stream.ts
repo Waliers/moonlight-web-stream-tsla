@@ -104,6 +104,9 @@ class ViewerApp implements Component {
     
     private wakeLock: WakeLockSentinel | null = null
     private hasInteracted = false
+    private audioStuckBadge: HTMLButtonElement | null = null
+    private audioStuckMonitorId: ReturnType<typeof setInterval> | null = null
+    private audioStuckSeconds = 0
     private cachedStreamRect: DOMRect | null = null
     private pollRafId: number | null = null
     private pollTimerId: ReturnType<typeof setTimeout> | null = null
@@ -131,8 +134,6 @@ class ViewerApp implements Component {
 
         // Create stats overlay early (before startStream which uses it async)
         this.statsOverlay = new StreamStatsOverlay()
-
-        this.startStream(hostId, appId, settings, [browserWidth, browserHeight])
 
         this.streamerSize = getStreamerSize(settings, [browserWidth, browserHeight])
 
@@ -190,6 +191,15 @@ class ViewerApp implements Component {
                 this.onGamepadAdd(gamepad)
             }
         }
+
+        // Started last: startStream is async and un-awaited, and its
+        // synchronous portion (up to statsOverlay.show()) reads
+        // this.canvasRenderer via the stats-enabled callback. Firing it
+        // before canvasRenderer is assigned above meant that callback always
+        // ran against null — worker-mode stats collection silently never
+        // turned on (2026-07-20 field report: worker stats stuck at all
+        // zeros forever, video otherwise playing fine).
+        this.startStream(hostId, appId, settings, [browserWidth, browserHeight])
     }
     private addListeners(element: GlobalEventHandlers) {
         element.addEventListener("keydown", this.onKeyDown.bind(this), { passive: false })
@@ -305,6 +315,7 @@ class ViewerApp implements Component {
             // Log the settings header even for sessions that never freeze —
             // otherwise clean A/B runs leave no record of what they tested.
             this.sendFreezeWatchContext()
+            this.startAudioStuckMonitor()
         } else if (data.type == "connectionTerminated" || data.type == "error") {
             this.freezeWatcher?.stop()
         } else if (data.type == "videoTrack") {
@@ -341,6 +352,54 @@ class ViewerApp implements Component {
             // settings should always be plain JSON-serializable data; a dump
             // failure must never break the stream
         }
+    }
+
+    /**
+     * "Tap to unmute" badge: once the platform suspends the AudioContext,
+     * programmatic resume() is gated behind a user gesture (Tesla enforces
+     * this — 2026-07-19 field session: resume() was retried ~50x/s for the
+     * whole silent period and denied every time). A tap is the only cure, so
+     * when audio has been stuck non-running for a few seconds, say so
+     * instead of leaving the user to discover tapping by accident.
+     */
+    private startAudioStuckMonitor() {
+        if (this.audioStuckMonitorId) return
+        this.audioStuckMonitorId = setInterval(() => {
+            const state = this.stream?.getAudioDiagnostics().audioContextState
+            const stuck = state === "suspended" || state === "interrupted"
+            this.audioStuckSeconds = stuck ? this.audioStuckSeconds + 1 : 0
+            if (this.audioStuckSeconds >= 3) {
+                this.showAudioStuckBadge()
+            } else if (!stuck) {
+                this.hideAudioStuckBadge()
+            }
+        }, 1000)
+    }
+
+    private showAudioStuckBadge() {
+        if (this.audioStuckBadge) return
+        const badge = document.createElement("button")
+        badge.innerText = "🔇 Tap to unmute"
+        badge.style.cssText =
+            "position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:1000;" +
+            "padding:10px 22px;border:1px solid rgba(100,200,255,0.6);border-radius:999px;" +
+            "background:rgba(0,0,0,0.65);color:white;font-size:16px;cursor:pointer;"
+        const unmute = (event: Event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            // The tap itself is the user gesture resume() needs
+            this.stream?.resumeAudio()
+        }
+        badge.addEventListener("click", unmute)
+        badge.addEventListener("touchend", unmute)
+        ;(document.getElementById("root") ?? document.body).appendChild(badge)
+        this.audioStuckBadge = badge
+    }
+
+    private hideAudioStuckBadge() {
+        if (!this.audioStuckBadge) return
+        this.audioStuckBadge.remove()
+        this.audioStuckBadge = null
     }
 
     private focusInput() {

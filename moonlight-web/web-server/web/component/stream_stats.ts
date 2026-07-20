@@ -27,6 +27,7 @@ type WorkerDiagnosticsSnapshot = {
         drawLatencyAvgMs?: number
         drawLatencyMaxMs?: number
         drawOnArrival?: boolean
+        usingBitmapRenderer?: boolean
         videoElementMode?: boolean
     } | null
     canvasRendererEnabled: boolean
@@ -78,6 +79,7 @@ export class StreamStatsOverlay implements Component {
     private elAudioPipeline = document.createElement("span")
     private elWorkerAudio = document.createElement("span")
     private elWorkerVideo = document.createElement("span")
+    private elStatsCost = document.createElement("span")
 
     // Previous snapshot for delta calculations
     private prevTimestamp = 0
@@ -128,6 +130,41 @@ export class StreamStatsOverlay implements Component {
         })
         this.root.appendChild(header)
 
+        // Copy button — the periodic server-log report is every 5 minutes
+        // (REPORT_INTERVAL_MS), too slow to grab a snapshot right after
+        // something interesting happens.
+        const copyRow = document.createElement("div")
+        copyRow.classList.add("stream-stats-row")
+        copyRow.style.textAlign = "center"
+        copyRow.style.justifyContent = "center"
+        // The overlay is pointer-events: none (so it never blocks touch/click
+        // input to the stream underneath) — re-enable it for the whole row,
+        // not just the button, so a touch that lands just outside the
+        // button's exact bounds (easy on a touchscreen) still hits something
+        // with pointer-events: auto instead of passing straight through.
+        copyRow.style.pointerEvents = "auto"
+        // Game input is captured via touchstart/touchend listeners on
+        // `document` (stream.ts addListeners()), which call preventDefault()
+        // unconditionally on every touch — that both suppresses the browser's
+        // synthetic click after a tap AND forwards the tap as in-game input.
+        // pointer-events:auto only fixes hit-testing; the touch event still
+        // bubbles through pointer-events:none ancestors to document
+        // regardless. Stopping propagation at the row (not just the button)
+        // catches taps that land in the row's padding too.
+        for (const eventName of ["touchstart", "touchend", "touchmove", "touchcancel"]) {
+            copyRow.addEventListener(eventName, (e) => e.stopPropagation())
+        }
+        const copyButton = document.createElement("button")
+        copyButton.textContent = "Copy Stats"
+        copyButton.style.cursor = "pointer"
+        copyButton.style.padding = "4px 14px"
+        copyButton.addEventListener("click", (e) => {
+            e.stopPropagation()
+            this.copyStatsToClipboard(copyButton)
+        })
+        copyRow.appendChild(copyButton)
+        this.root.appendChild(copyRow)
+
         const rows: Array<[string, HTMLSpanElement]> = [
             ["Resolution", this.elVideoRes],
             ["Codec", this.elCodec],
@@ -153,6 +190,7 @@ export class StreamStatsOverlay implements Component {
             ["Audio Pipeline", this.elAudioPipeline],
             ["Worker Audio", this.elWorkerAudio],
             ["Worker Video", this.elWorkerVideo],
+            ["Stats Cost", this.elStatsCost],
         ]
 
         for (const [label, valueEl] of rows) {
@@ -231,11 +269,48 @@ export class StreamStatsOverlay implements Component {
         }
     }
 
-    /** Builds a plaintext dump of every currently-displayed stat and hands it to the report callback, if any. */
+    /** Plaintext dump of every currently-displayed stat, in row order. */
+    private buildStatsText(): string {
+        const lines = this.statRows.map(([label, valueEl]) => `${label}: ${valueEl.textContent}`)
+        return `[Stream Stats]\n${lines.join("\n")}`
+    }
+
+    /** Hands the current stats dump to the report callback, if any. */
     private reportStats() {
         if (!this.statsReportCallback) return
-        const lines = this.statRows.map(([label, valueEl]) => `${label}: ${valueEl.textContent}`)
-        this.statsReportCallback(`[Stream Stats]\n${lines.join("\n")}`)
+        this.statsReportCallback(this.buildStatsText())
+    }
+
+    /** Copies the current stats dump to the clipboard — an immediate
+     * alternative to the periodic (5-minute) server-log report. */
+    private async copyStatsToClipboard(button: HTMLButtonElement) {
+        const text = this.buildStatsText()
+        const original = button.textContent
+        try {
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text)
+            } else {
+                throw new Error("Clipboard API unavailable")
+            }
+            button.textContent = "Copied!"
+        } catch {
+            // Fallback for browsers without navigator.clipboard (or denied
+            // permission, e.g. non-secure context): select a hidden textarea
+            // and use the legacy copy command.
+            const ta = document.createElement("textarea")
+            ta.value = text
+            ta.style.position = "fixed"
+            ta.style.opacity = "0"
+            document.body.appendChild(ta)
+            ta.select()
+            let copied = false
+            try {
+                copied = document.execCommand("copy")
+            } catch { /* ignore */ }
+            document.body.removeChild(ta)
+            button.textContent = copied ? "Copied!" : "Copy failed"
+        }
+        setTimeout(() => { button.textContent = original }, 1500)
     }
 
     isVisible(): boolean {
@@ -243,6 +318,7 @@ export class StreamStatsOverlay implements Component {
     }
 
     private statsProcessingMs: number = 0
+    private lastStatsWallMs: number = 0
     private updatePending = false
 
     private scheduleUpdate() {
@@ -464,6 +540,14 @@ export class StreamStatsOverlay implements Component {
             this.elFreezeWatchLast.textContent = "—"
         }
 
+        // Instrumentation self-cost, measured on-device: how much the stats
+        // machinery itself spends (answering "is the logging slowing us down"
+        // with numbers instead of assumptions). getStats wall time is mostly
+        // off-main-thread; proc is the main-thread share.
+        this.elStatsCost.textContent =
+            `overlay proc ${this.statsProcessingMs.toFixed(1)} ms + getStats ${this.lastStatsWallMs.toFixed(1)} ms wall @0.5Hz` +
+            `; watcher: ${freezeWatcher?.getSelfCostLine() ?? "—"}`
+
         this.elVideoRes.textContent = videoWidth > 0 ? `${videoWidth}×${videoHeight}` : "—"
         this.elCodec.textContent = codec || "—"
         this.elFps.textContent = framesPerSecond > 0 ? `${framesPerSecond}` : "—"
@@ -515,7 +599,7 @@ export class StreamStatsOverlay implements Component {
             if (workerDiag.canvasRendererEnabled) {
                 if (workerDiag.canvas) {
                     const c = workerDiag.canvas
-                    const modeLabel = c.videoElementMode ? "vidElem" : (c.active ? "worker" : "main")
+                    const modeLabel = c.videoElementMode ? "vidElem" : (c.active ? "worker" : (c.usingBitmapRenderer ? "main-bitmap" : "main-2d"))
                     const dropLabel = c.active ? "dropped" : "rafMiss"
                     const gapStr = c.minGapMs >= 0
                         ? `, gaps: ${c.minGapMs.toFixed(1)}/${c.avgGapMs.toFixed(1)}/${c.maxGapMs.toFixed(1)} ms`
