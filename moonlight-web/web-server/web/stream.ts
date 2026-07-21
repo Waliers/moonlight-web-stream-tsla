@@ -258,6 +258,9 @@ class ViewerApp implements Component {
         this.freezeWatcher.setAudioStatsPoller(() => this.stream?.requestAudioWorkletStats())
         this.freezeWatcher.onEvent((event, summary) => {
             this.sendFreezeWatchContext()
+            if (event.kind === "video-freeze") {
+                this.stream?.notifyFreezeEvent(event.cause)
+            }
             this.stream?.sendClientLogMessage(
                 `[FreezeWatch] +${(event.atMs / 1000).toFixed(1)}s ${event.kind} ` +
                 `${Math.round(event.durationMs)}ms cause=${event.cause} | ${event.detail} ` +

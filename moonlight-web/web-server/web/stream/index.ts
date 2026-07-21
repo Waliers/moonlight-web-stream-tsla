@@ -105,6 +105,26 @@ export class Stream {
     private peer: RTCPeerConnection | null = null
     private input: StreamInput
 
+    // Reactive jitter buffer: see notifyFreezeEvent() for the full design.
+    private videoReceiver: RTCRtpReceiver | null = null
+    private jitterBufferFloorMs = 0
+    private jitterBufferCurrentMs = 0
+    private jitterBufferRecoveryTimeoutId: ReturnType<typeof setTimeout> | null = null
+    // Field-proven (settings_menu.ts Gaming preset comment): "80ms -> ZERO
+    // freezes in a 9-minute session" — used as the temporary recovery
+    // ceiling, not a permanent setting.
+    private static readonly JITTER_RECOVERY_MS = 80
+    // How long to hold the raised target after the LAST qualifying freeze
+    // event before decaying back to the floor. A new qualifying event during
+    // the window resets this timer (extends the elevated period) rather than
+    // raising the target further — it's capped at JITTER_RECOVERY_MS.
+    private static readonly JITTER_RECOVERY_COOLDOWN_MS = 20_000
+    // Only these causes are ones a bigger jitter buffer can actually help
+    // with (see freeze_watch.ts's own cause comments) — host-side drops,
+    // main-thread stalls, and full radio outages aren't fixed by buffering
+    // more on the receive side, so don't react to them.
+    private static readonly JITTER_REACTIVE_CAUSES = new Set(["network-jitter", "link-stall", "packet-loss", "nack-recovery"])
+
     private streamerSize: [number, number]
 
     private audioContext: AudioContext | null = null
@@ -977,19 +997,21 @@ export class Stream {
             // 0 = lowest latency; raising it lets the browser's jitter buffer
             // absorb network jitter (smoother on LTE) at the cost of latency.
             const targetMs = Math.max(0, this.settings.jitterBufferMs ?? 0)
-            if ("jitterBufferTarget" in event.receiver) {
-                try {
-                    // @ts-ignore
-                    event.receiver.jitterBufferTarget = targetMs;
-                } catch (e) {
-                    this.debugLog(`Failed to set jitterBufferTarget: ${e}`)
+            this.applyJitterBufferTarget(event.receiver, targetMs)
+            this.debugLog(`Receiver jitter buffer target: ${targetMs}ms`)
+
+            // Only track the VIDEO receiver for the reactive backoff —
+            // audio's jitter buffer is set once here too (unrelated to this
+            // mechanism) but isn't part of the freeze-reactive adjustment.
+            if (event.track.kind === "video") {
+                this.videoReceiver = event.receiver
+                this.jitterBufferFloorMs = targetMs
+                this.jitterBufferCurrentMs = targetMs
+                if (this.jitterBufferRecoveryTimeoutId) {
+                    clearTimeout(this.jitterBufferRecoveryTimeoutId)
+                    this.jitterBufferRecoveryTimeoutId = null
                 }
             }
-            if ("playoutDelayHint" in event.receiver) {
-                // @ts-ignore
-                event.receiver.playoutDelayHint = targetMs / 1000;
-            }
-            this.debugLog(`Receiver jitter buffer target: ${targetMs}ms`)
         }
 
         if(!this.settings?.canvasRenderer) {
@@ -1026,6 +1048,65 @@ export class Stream {
             }
         }
     }
+
+    private applyJitterBufferTarget(receiver: RTCRtpReceiver, ms: number) {
+        if ("jitterBufferTarget" in receiver) {
+            try {
+                // @ts-ignore
+                receiver.jitterBufferTarget = ms;
+            } catch (e) {
+                this.debugLog(`Failed to set jitterBufferTarget: ${e}`)
+            }
+        }
+        if ("playoutDelayHint" in receiver) {
+            // @ts-ignore
+            receiver.playoutDelayHint = ms / 1000;
+        }
+    }
+
+    /**
+     * Reactive jitter buffer. Called by ViewerApp for every FreezeWatch
+     * event. If the cause is one a bigger buffer can actually help with,
+     * temporarily raises the video receiver's jitter buffer target to
+     * JITTER_RECOVERY_MS, then decays back to the user's configured floor
+     * after JITTER_RECOVERY_COOLDOWN_MS of quiet. A new qualifying event
+     * during the cooldown extends the window rather than escalating further
+     * — the target is capped at JITTER_RECOVERY_MS, never stacks higher.
+     * The floor itself (calm-condition behavior) is untouched; this only
+     * pays extra latency right after evidence a freeze actually happened.
+     */
+    notifyFreezeEvent(cause: string) {
+        if (!this.videoReceiver) return
+        if (!Stream.JITTER_REACTIVE_CAUSES.has(cause)) return
+        if (this.jitterBufferFloorMs >= Stream.JITTER_RECOVERY_MS) return
+
+        if (this.jitterBufferRecoveryTimeoutId) {
+            clearTimeout(this.jitterBufferRecoveryTimeoutId)
+        } else {
+            this.debugLog(`[JitterBuffer] raising ${this.jitterBufferFloorMs}ms -> ${Stream.JITTER_RECOVERY_MS}ms after ${cause}`)
+            this.sendClientLogMessage(`[JitterBuffer] raising ${this.jitterBufferFloorMs}ms -> ${Stream.JITTER_RECOVERY_MS}ms after ${cause}`)
+        }
+        this.applyJitterBufferTarget(this.videoReceiver, Stream.JITTER_RECOVERY_MS)
+        this.jitterBufferCurrentMs = Stream.JITTER_RECOVERY_MS
+
+        this.jitterBufferRecoveryTimeoutId = setTimeout(() => {
+            this.jitterBufferRecoveryTimeoutId = null
+            if (!this.videoReceiver) return
+            this.debugLog(`[JitterBuffer] decaying back to floor ${this.jitterBufferFloorMs}ms`)
+            this.sendClientLogMessage(`[JitterBuffer] decaying back to floor ${this.jitterBufferFloorMs}ms`)
+            this.applyJitterBufferTarget(this.videoReceiver, this.jitterBufferFloorMs)
+            this.jitterBufferCurrentMs = this.jitterBufferFloorMs
+        }, Stream.JITTER_RECOVERY_COOLDOWN_MS)
+    }
+
+    getJitterBufferDiagnostics() {
+        return {
+            floorMs: this.jitterBufferFloorMs,
+            currentMs: this.jitterBufferCurrentMs,
+            elevated: this.jitterBufferRecoveryTimeoutId != null,
+        }
+    }
+
     private onConnectionStateChange() {
         if (!this.peer) {
             this.debugLog("OnConnectionStateChange without a peer")

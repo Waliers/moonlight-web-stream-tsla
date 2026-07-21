@@ -570,8 +570,12 @@ export class StreamStatsOverlay implements Component {
         const jbMinDelta     = jitterBufferMinimumDelay - this.prevJitterBufferMinimumDelay
         const avgJbDelayMs   = jbEmittedDelta > 0 ? (jbDelayDelta / jbEmittedDelta * 1000) : -1
         const floorJbMs      = jbEmittedDelta > 0 ? (jbMinDelta / jbEmittedDelta * 1000) : -1
+        const jbDiag = this.streamGetter?.()?.getJitterBufferDiagnostics()
+        const jbTargetStr = jbDiag
+            ? `, target ${jbDiag.currentMs}ms${jbDiag.elevated ? ` (raised from ${jbDiag.floorMs}ms)` : ""}`
+            : ""
         this.elJitter.textContent = jitter > 0
-            ? `net ${(jitter * 1000).toFixed(1)} ms, buf avg ${avgJbDelayMs >= 0 ? avgJbDelayMs.toFixed(1) : "?"} ms (floor ${floorJbMs >= 0 ? floorJbMs.toFixed(1) : "?"} ms)`
+            ? `net ${(jitter * 1000).toFixed(1)} ms, buf avg ${avgJbDelayMs >= 0 ? avgJbDelayMs.toFixed(1) : "?"} ms (floor ${floorJbMs >= 0 ? floorJbMs.toFixed(1) : "?"} ms)${jbTargetStr}`
             : "\u2014"
 
         const stream = this.streamGetter?.()
