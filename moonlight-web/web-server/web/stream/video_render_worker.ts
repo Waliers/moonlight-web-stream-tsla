@@ -83,6 +83,19 @@ let lastArrivedTimestamp: number = -1
 let workerDrawn = 0
 let workerDropped = 0
 
+// === Bitmap-renderer pipelining (2026-07-21) ===
+// createImageBitmap() (decode+resize, the expensive part) and
+// transferFromImageBitmap() (the actual present, cheap+synchronous) are
+// separable. Starting createImageBitmap() on arrival instead of waiting for
+// the next vsync tick overlaps that cost with whatever idle time exists
+// before the next tick — but transferFromImageBitmap() must ONLY ever be
+// called from rafDrawTick. If presentation timing slips off vsync, this
+// degenerates back into draw-on-arrival and its felt micro-stutter (see the
+// comment above) — that invariant is the whole point, don't relax it.
+let pendingRawFrame: VideoFrame | null = null  // arrived, createImageBitmap not started yet
+let pendingBitmap: ImageBitmap | null = null   // ready, awaiting the next vsync tick to present
+let bitmapCreationInFlight = false             // at most one createImageBitmap() at a time
+
 // Stats reporting enabled flag — controlled by main thread
 let statsEnabled = false
 
@@ -136,7 +149,18 @@ function scheduleFrame(frame: VideoFrame) {
     lastFrameTimestamp = frame.timestamp
     lastArrivedTimestamp = frame.timestamp
 
-    // Store as latest — the rAF loop below draws it, at most once per vsync.
+    if (useBitmapRenderer && bitmapCtx) {
+        // Superseded before decode even started — never costs anything.
+        if (pendingRawFrame) {
+            pendingRawFrame.close()
+            workerDropped++
+        }
+        pendingRawFrame = frame
+        startBitmapCreationIfIdle()
+        return
+    }
+
+    // Non-bitmap (2D) path: unchanged, still purely vsync-tick-driven.
     const prev = latestFrame
     latestFrame = frame
     latestFrameDrawn = false
@@ -147,8 +171,60 @@ function scheduleFrame(frame: VideoFrame) {
     }
 }
 
+/** Starts createImageBitmap() for pendingRawFrame if nothing's already in
+ * flight. Called on arrival AND right after the previous call resolves, so
+ * decode/resize work stays maximally overlapped with network/vsync timing
+ * instead of only ever starting at a vsync tick. */
+function startBitmapCreationIfIdle() {
+    if (bitmapCreationInFlight || !pendingRawFrame || !bitmapCtx || !canvas) return
+    const frame = pendingRawFrame
+    pendingRawFrame = null
+    if (drawWidth === 0 || drawHeight === 0) {
+        recalcForFrame(frame)
+    }
+    bitmapCreationInFlight = true
+    createImageBitmap(frame, {
+        resizeWidth: drawWidth,
+        resizeHeight: drawHeight,
+        resizeQuality: "low",
+    }).then((bitmap) => {
+        frame.close()
+        bitmapCreationInFlight = false
+        if (!canvas) {
+            // Stream stopped while this was in flight — nothing left to
+            // present it to.
+            bitmap.close()
+            return
+        }
+        if (pendingBitmap) {
+            // Shouldn't normally happen (single in-flight, and rafDrawTick
+            // always drains pendingBitmap) but stay safe if a tick is
+            // mid-flight when this resolves.
+            pendingBitmap.close()
+            workerDropped++
+        }
+        pendingBitmap = bitmap
+        startBitmapCreationIfIdle()
+    }).catch(() => {
+        frame.close()
+        bitmapCreationInFlight = false
+        startBitmapCreationIfIdle()
+    })
+}
+
 function rafDrawTick() {
     rafId = workerSelf.requestAnimationFrame(rafDrawTick)
+
+    if (useBitmapRenderer && bitmapCtx) {
+        if (!pendingBitmap) return
+        const bitmap = pendingBitmap
+        pendingBitmap = null
+        bitmapCtx.transferFromImageBitmap(bitmap)
+        bitmap.close()
+        workerDrawn++
+        return
+    }
+
     if (!latestFrame || latestFrameDrawn) return
     const frame = latestFrame
     latestFrameDrawn = true
@@ -174,6 +250,16 @@ function stopRafLoop() {
         latestFrame = null
     }
     latestFrameDrawn = true
+    if (pendingRawFrame) {
+        pendingRawFrame.close()
+        pendingRawFrame = null
+    }
+    if (pendingBitmap) {
+        pendingBitmap.close()
+        pendingBitmap = null
+    }
+    // bitmapCreationInFlight is left as-is — its own .then()/.catch() checks
+    // pendingRawFrame/canvas and no-ops harmlessly if the stream has stopped.
 }
 
 // Reusable stats message — avoids allocation each interval
@@ -246,26 +332,9 @@ function drawFrame(frame: VideoFrame) {
         recalcForFrame(frame)
     }
 
-    if (useBitmapRenderer && bitmapCtx) {
-        // ImageBitmapRenderingContext path: atomic frame handoff to compositor
-        // createImageBitmap resize handles scaling; transferFromImageBitmap is a
-        // zero-copy ownership transfer that guarantees the compositor picks it up.
-        createImageBitmap(frame, {
-            resizeWidth: drawWidth,
-            resizeHeight: drawHeight,
-            resizeQuality: "low",
-        }).then(bitmap => {
-            bitmapCtx!.transferFromImageBitmap(bitmap)
-            // Explicitly close the bitmap to eagerly free the JS wrapper and reduce GC pressure
-            bitmap.close()
-            // Close the frame ONLY after createImageBitmap is done to ensure it's not prematurely recycled
-            frame.close()
-        }).catch(() => {
-            frame.close()
-        })
-        return
-    }
-
+    // Bitmap-renderer mode never reaches here — scheduleFrame() routes it
+    // through startBitmapCreationIfIdle()/rafDrawTick instead (see the
+    // pipelining comment near the top of the file).
     if (!ctx) {
         frame.close()
         return
@@ -333,6 +402,12 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
         }
         lastArrivedTimestamp = -1
         lastArrivalMs = -1
+        // Discard anything left over from the previous stream (e.g. an ICE
+        // restart mid-session) so it can't leak into the new one's timeline.
+        if (latestFrame) { latestFrame.close(); latestFrame = null }
+        latestFrameDrawn = true
+        if (pendingRawFrame) { pendingRawFrame.close(); pendingRawFrame = null }
+        if (pendingBitmap) { pendingBitmap.close(); pendingBitmap = null }
         activeStreamReader = data.stream.getReader()
         readStreamLoop(activeStreamReader)
         return
