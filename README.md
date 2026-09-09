@@ -21,6 +21,7 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
   - [Manual Setup](#manual-setup)
 - [Setup](#setup)
   - [Streaming to a Tesla Browser](#streaming-to-a-tesla-browser)
+    - [Keyboard and mouse on Tesla](#keyboard-and-mouse-on-tesla)
     - [Getting a free domain name](#getting-a-free-domain-name)
   - [Troubleshooting](#troubleshooting)
   - [Streaming over the Internet](#streaming-over-the-internet)
@@ -28,6 +29,7 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
     - [Let's Encrypt (recommended)](#option-a-lets-encrypt-recommended-for-tesla--public-access)
     - [Self-signed certificate](#option-b-self-signed-certificate)
   - [Proxying via Apache 2](#proxying-via-apache-2)
+- [URL Parameters](#url-parameters)
 - [Config](#config)
   - [Credentials](#credentials)
   - [Two-Factor Authentication (2FA)](#two-factor-authentication-2fa)
@@ -52,6 +54,7 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
 - Features that only work in a [Secure Context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts#:~:text=They%20must%20be,be%20considered%20deprecated.) -> [How to configure a Secure Context / https](#configuring-https)
   - Keyboard Lock (allows to capture almost all keys also OS Keys): [Experimental Keyboard Lock API](https://developer.mozilla.org/en-US/docs/Web/API/Keyboard_API)
 - Controllers (USB/Bluetooth gamepads): work over HTTP via the [Gamepad API](https://developer.mozilla.org/en-US/docs/Web/API/Gamepad_API) — no HTTPS required
+- **Tesla browser: keyboard and mouse do not work natively.** Use a second device (e.g. an Android phone) as the input device via [Attach Input Only](#keyboard-and-mouse-on-tesla)
 
 ## Installation
 
@@ -110,6 +113,24 @@ The Tesla browser enforces strict security policies. Accessing Moonlight Web via
 1. A **domain name** pointing to your public IP (see [Getting a free domain name](#getting-a-free-domain-name) below)
 2. Port forwarding configured on your router
 3. (Recommended) An HTTPS certificate for the domain — see [Configuring https](#configuring-https)
+
+#### Keyboard and mouse on Tesla
+
+Keyboard and mouse input do not work natively in the Tesla browser. To type or use a pointer,
+attach a **second device** as a dedicated input client:
+
+1. Start the stream on the Tesla as usual.
+2. On a second device (an Android phone works well) open the same Moonlight Web server and log in.
+3. In the games list, click (or long-press) the **currently running** game.
+4. Choose **"Attach Input Only"** from the context menu.
+
+This opens a second, input-only connection (`input.html?hostId=<id>`) that carries keyboard, mouse,
+touch and controller input to the host but no video or audio. The Tesla keeps showing the picture;
+the phone becomes the keyboard and trackpad.
+
+The option only appears while a session is actually running on that host. Several input devices can
+be attached at once, the stream page shows an indicator when any are connected, and detaching one
+does not disturb the video stream on the Tesla.
 
 #### Getting a free domain name
 
@@ -390,6 +411,36 @@ sudo a2enconf moonlight-web
 
 5. Use https with a certificate (Optional)
 
+## URL Parameters
+
+The stream page accepts settings as query-string parameters, so a bookmark or launcher can pin a
+configuration without changing your saved settings. Overrides apply to **that launch only** and are
+never written back to the stored per-host settings.
+
+```
+stream.html?hostId=1&appId=2&bitrate=8000&fps=60&videoSize=1080p
+```
+
+| Parameter | Values | Description |
+|---|---|---|
+| `hostId` | number | **Required.** Which host to stream from. |
+| `appId` | number | **Required.** Which app/game to launch. |
+| `bitrate` | number (kbps) | Video bitrate, e.g. `8000` for 8 Mbps. |
+| `fps` | number | Target framerate, e.g. `30`, `60`, `120`. |
+| `videoSize` | `720p`, `1080p`, `1440p`, `4k`, `native`, `custom` | Stream resolution. `native` uses the viewing browser's own screen size. |
+| `videoSizeCustom.width` | number | Custom width. Only takes effect with `videoSize=custom`. |
+| `videoSizeCustom.height` | number | Custom height. Only takes effect with `videoSize=custom`. |
+
+Anything omitted falls back to your saved settings for that host. Values that aren't valid numbers
+are ignored rather than applied, and `videoSizeCustom.width`/`.height` are only honoured as a pair —
+supplying one without the other changes nothing.
+
+The input-only page takes just the host:
+
+```
+input.html?hostId=1
+```
+
 ## Config
 The config file is under `server/config.json` relative to the executable.
 Here are the most important settings for configuring Moonlight Web.
@@ -558,10 +609,10 @@ Required for building:
 
 ### Crate: Moonlight Web Server
 This is the web server for Moonlight Web found at `moonlight-web/web-server/`.
-It'll spawn a multiple [streamers](#crate-moonlight-web-server) as a subprocess for handling each stream.
+It'll spawn a multiple [streamers](#crate-moonlight-web-streamer) as a subprocess for handling each stream.
 
 Required for building:
-- [moonlight-common-sys](#moonlight-common-sys)
+- [moonlight-common-sys](#crate-moonlight-common-sys)
 
 Build the web frontend with [npm](https://docs.npmjs.com/downloading-and-installing-node-js-and-npm).
 ```sh
@@ -575,7 +626,7 @@ This is the streamer subprocess of the [web server](#crate-moonlight-web-server)
 It'll communicate via stdin and stdout with the web server to negotiate the WebRTC peers and then continue to communicate via the peer.
 
 Required for building:
-- [moonlight-common-sys](#moonlight-common-sys)
+- [moonlight-common-sys](#crate-moonlight-common-sys)
 
 ## Why this fork exists
 

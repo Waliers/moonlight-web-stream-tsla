@@ -803,7 +803,10 @@ input[type="range"] {
 /** Stream */
 .video-stream {
     position: fixed;
-    top: 50%;
+    /* --stream-video-offset is set by stream.ts while the on-screen keyboard is
+       up, to lift the picture out from behind it. Unset (0px) in the normal case,
+       so this costs nothing when no keyboard is showing. */
+    top: calc(50% + var(--stream-video-offset, 0px));
     left: 50%;
     transform: translate(-50%, -50%);
     max-width: 100vw;
@@ -820,7 +823,7 @@ canvas.video-stream {
        to apply a matrix on every vsync even when the canvas content hasn't changed.
        For a full-viewport canvas, position: fixed + inset: 0 achieves the same layout
        without any per-frame compositor cost. */
-    top: 0;
+    top: var(--stream-video-offset, 0px);
     left: 0;
     transform: none;
     width: 100vw;

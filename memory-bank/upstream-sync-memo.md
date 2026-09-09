@@ -2,10 +2,11 @@
 
 ## Upstream: MrCreativ3001/moonlight-web-stream
 - Remote name: `upstream`
-- Last commit checked: `9e2fed0` (upstream/master) — "Improve mobile screen keyboard handling (#137)"
-- Date of sync review: 2025-07-09
+- Last commit checked: `09848de` (upstream/master) — "chore: bump version to 3.0.0-prerelease.2"
+- Date of sync review: 2026-08-15
+- Previous sync point: `9e2fed0` (2025-07-09)
 - Merge base: `653558efddb7958419a129f06b6fc1965b1d2d9d`
-- Total commits ahead at time of review: 514
+- New commits in this review: 173 (`git log 9e2fed0..upstream/master`)
 
 ## Structure Difference
 Upstream restructured paths in v2:
@@ -14,6 +15,22 @@ Upstream restructured paths in v2:
 - `moonlight-web/web-server/src/` → `src/`
 
 Our fork keeps the old path structure.
+
+### v3 rewrite (2026-08) — the big one
+Upstream merged `feat/stream-rework` at `6cda105` and is now on `3.0.0-prerelease.2`.
+This is a **second** architectural rewrite on top of v2:
+- `moonlight-common-rust` compiled to WASM via uniffi and run **in the browser**
+- webpack build pipeline (replaces plain `tsc`)
+- WHEP-based streaming, reworked control stream over enet
+- rustls replaces OpenSSL — **and upstream deleted their custom cross images as
+  no longer needed** (`65dbab3`). Relevant to our build pain, but a large change.
+- reworked config system, i18n, multi-user roles/permissions
+
+**Consequence for future syncs:** of the 173 new commits, only 10 were on the
+pre-v3 master line; the other 163 are written against an architecture we don't
+share. Filter with `git merge-base --is-ancestor <commit> 6cda105^1` to tell a
+v2-line commit from a v3 one. Post-v3 upstream commits are generally **not**
+cherry-pickable — they must be re-implemented, if they apply at all.
 
 ## Commits Ported
 
@@ -32,6 +49,38 @@ Our fork keeps the old path structure.
 | 2197926 | Mouse buttons X1/X2 | Extended StreamMouseButton + BUTTON_MAPPINGS |
 | 716042a | More keyboard keys | Enabled PageUp, Delete, End, PageDown, NumpadDivide, Home, Insert |
 | 50fe9af | navigator.keyboard.lock in iframe | requestKeyboardLock helper for iframe environments |
+
+### 2026-08-15 review (9e2fed0 → 09848de)
+
+| Commit | Description | Notes |
+|--------|-------------|-------|
+| a7631c3 | Keyboard viewport adjustment (#138) | Adapted: `KeyboardModeWillChangeEvent` in screen_keyboard.ts + viewport offset in stream.ts. CSS folded into our single `styles.css`. |
+| ed51100 | Keyboard viewport adjustment, non-local-cursor mode | Only this branch of the logic applies — we have no local-cursor mode, so upstream's cursor-tracking path was dropped. |
+| 55391a9 | Launch-time stream settings via query params | Adapted to our `StreamSettings`: `bitrate`, `fps`, `videoSize`, `videoSizeCustom.width/height`. No `hdr`/`dataTransport`/`language` in our fork. Added numeric validation upstream lacks. |
+
+Deviations worth remembering:
+- Upstream drives the viewport update from a **permanent rAF loop**; we drive it
+  from `visualViewport` resize/scroll events instead — our `onTouchUpdate` only
+  runs while touch/gamepad polling is active, and a always-on rAF is exactly the
+  kind of cost this fork avoids.
+- Our `getStreamRect()` **caches**. The offset moves the element without
+  resizing it, so neither the resize listener nor the ResizeObserver fires —
+  `setStreamVideoOffset()` clears `cachedStreamRect` by hand. Without that,
+  touch/mouse coordinates stay mapped to the old position.
+- The floating keyboard button needed `margin:0` — the global `button { margin: 8px }`
+  was shifting it, because `top`/`right` on a fixed element offset the *margin* edge.
+- **The video offset is a no-op on our default config** (`canvasRenderer: true` +
+  `stretchToFit: true` = full-viewport canvas, so there is no slack to lift into).
+  It becomes active for the `<video>` element path and letterboxed canvas.
+- **And it is inert on the Tesla entirely**: the Tesla on-screen keyboard opens
+  *over* the page without resizing the viewport, so `visualViewport` never
+  shrinks and the whole adjustment never engages. The port is carried for other
+  browsers (phone/tablet against the same server), not for the car.
+- Because of that, the shrink test (`KEYBOARD_VIEWPORT_SHRINK_MIN_PX`) gates the
+  floating **button** as well as the video. Without that gate a visualViewport
+  resize from an unrelated cause (rotation, window resize) would park the
+  hide-keyboard button at the bottom of the screen — directly underneath an
+  overlay keyboard, where it can't be tapped.
 
 ## Commits Skipped (with reasons)
 
@@ -73,12 +122,42 @@ Our fork keeps the old path structure.
 ### Cosmetic/README/Docs
 - 0140714, b269a43, 6f58578, 0cd6961, 9e1c3a1, etc.
 
+## Commits Skipped — 2026-08-15 review
+
+### v2-line, not applicable
+- `752d8bd` (fix bad header length in websocket): we are WebRTC-only
+- `301ad07` (fix pairing timeout): **already present** in our `web/api.ts` —
+  we have `noTimeout` plus a dangling-timer cleanup upstream lacks
+
+### v3-line, checked and rejected
+- `8f3c49d` (clamp negative frame durations): looked high-value — u32 µs timestamp
+  wraps every ~71 min and the negative delta throws in `EncodedVideoChunk` — but
+  **N/A**: we have no manual depacketize path. Video arrives on a native WebRTC
+  transceiver and the browser stack handles it. No `EncodedVideoChunk` in our tree.
+- `3079171` (VideoDecoder codec-string level vs stream dimensions): only touches
+  our *capability probe* (`VideoDecoder.isConfigSupported`), not a decode path.
+  Worth noting though: our probe string is `avc1.4d400c` = **level 1.2** while we
+  run 1080p60, so the probe asks an optimistic question. Latent, not a bug.
+- `e5ea7e3`/`d10b9b9` (sidebar hide-until-hover): needs i18n + `styles/standard.css`
+- `843ae22`, `d1a431d`, `1f9fad1`: v3 `stream.ts`/`input.ts` internals
+- `ffc1659` (forwarded header ignore case): server-side, our `src/` layer differs.
+  Could matter behind a reverse proxy — revisit if that ever bites.
+- `4ed7242`: removed client batching "because it caused mouse stuttering" —
+  independent corroboration of our own pass-3 batching revert. Nothing to port.
+
 ## How to Repeat This Process
 
 1. `git fetch upstream`
-2. Check new commits: `git log upstream/master --oneline --reverse | Select-Object -Skip N` (where N was 514 last time)
-3. For each commit, check if it touches web frontend: `git show <hash> --stat`
-4. If relevant, get diff: `git show <hash> -- moonlight-web/web-server/web/ web/`
-5. Adapt path from upstream's `web/` to our `moonlight-web/web-server/web/`
-6. After porting, run `npm run build-light` in `moonlight-web/web-server/`
-7. Update this memo with new commits ported/skipped
+2. New commits since last review: `git log <last-checked>..upstream/master --oneline --reverse`
+   (record the hash in the header above rather than a commit *count* — counts go
+   stale the moment upstream force-pushes or merges a branch)
+3. Split v2-line from v3-line: `git merge-base --is-ancestor <commit> 6cda105^1`
+   — exit 0 means pre-v3 and plausibly cherry-pickable
+4. For each candidate, check what it touches: `git show <hash> --stat`
+5. If relevant, get diff: `git show <hash> -- moonlight-web/web-server/web/ web/`
+6. Adapt path from upstream's `web/` to our `moonlight-web/web-server/web/`
+7. **Check the ported code against our divergences** before trusting it: cached
+   `getStreamRect()`, no local-cursor mode, single `styles.css`, canvas renderer
+   default, no i18n, WebRTC-only transport
+8. After porting, run `npm run build-light` in `moonlight-web/web-server/`
+9. Update this memo with new commits ported/skipped

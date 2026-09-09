@@ -1,6 +1,9 @@
 
 export type TextEvent = CustomEvent<{ text: string }>
 export type KeyboardModeEvent = CustomEvent<{ enabled: boolean }>
+/** Fired *before* the mode flips, so listeners can sample viewport geometry
+ * while the on-screen keyboard is still in its previous state. */
+export type KeyboardModeWillChangeEvent = CustomEvent<{ enabled: boolean }>
 
 const KEYBOARD_SENTINEL = " "
 
@@ -44,6 +47,13 @@ export class ScreenKeyboard {
     }
     private setEnabled(enabled: boolean) {
         const changed = this.enabled != enabled
+        if (changed) {
+            const event: KeyboardModeWillChangeEvent = new CustomEvent("ml-keyboardmodewillchange", {
+                detail: { enabled }
+            })
+            this.eventTarget.dispatchEvent(event)
+        }
+
         this.enabled = enabled
 
         if (enabled) {
@@ -79,6 +89,9 @@ export class ScreenKeyboard {
     }
     addKeyboardModeListener(listener: (event: KeyboardModeEvent) => void) {
         this.eventTarget.addEventListener("ml-keyboardmode", listener as any)
+    }
+    addKeyboardModeWillChangeListener(listener: (event: KeyboardModeWillChangeEvent) => void) {
+        this.eventTarget.addEventListener("ml-keyboardmodewillchange", listener as any)
     }
 
     // -- Events
