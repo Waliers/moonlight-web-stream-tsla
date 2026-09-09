@@ -225,30 +225,150 @@ async fn main2() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Drops commas that appear (outside string literals) immediately before a
+/// `}` or `]`, ignoring intervening whitespace. Hand-edited config files
+/// commonly pick up a trailing comma when a list entry gets added or
+/// removed — plain JSON rejects that, so tolerate it here rather than fail
+/// startup over one extra character. Not a general JSON5 parser: this is
+/// the one specific, well-understood leniency, nothing else (no comments,
+/// no unquoted keys, no single quotes).
+fn strip_trailing_commas(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+
+        if c == ',' {
+            let mut lookahead = chars.clone();
+            let mut is_trailing = false;
+            while let Some(&next) = lookahead.peek() {
+                if next.is_whitespace() {
+                    lookahead.next();
+                } else {
+                    is_trailing = next == '}' || next == ']';
+                    break;
+                }
+            }
+            if is_trailing {
+                continue; // drop this comma
+            }
+        }
+
+        out.push(c);
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod config_parsing_tests {
+    use super::strip_trailing_commas;
+
+    #[test]
+    fn drops_trailing_comma_in_object() {
+        assert_eq!(strip_trailing_commas(r#"{"a": 1,}"#), r#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn drops_trailing_comma_in_array() {
+        assert_eq!(strip_trailing_commas(r#"[1, 2,]"#), r#"[1, 2]"#);
+    }
+
+    #[test]
+    fn drops_trailing_comma_across_whitespace_and_newlines() {
+        let input = "[\n    1,\n    2,\n]";
+        let expected = "[\n    1,\n    2\n]";
+        assert_eq!(strip_trailing_commas(input), expected);
+    }
+
+    #[test]
+    fn drops_nested_trailing_commas() {
+        assert_eq!(
+            strip_trailing_commas(r#"{"a": [1, 2,], "b": {"c": 3,},}"#),
+            r#"{"a": [1, 2], "b": {"c": 3}}"#
+        );
+    }
+
+    #[test]
+    fn leaves_non_trailing_commas_alone() {
+        assert_eq!(strip_trailing_commas(r#"{"a": 1, "b": 2}"#), r#"{"a": 1, "b": 2}"#);
+    }
+
+    #[test]
+    fn ignores_comma_like_patterns_inside_strings() {
+        // A string ending in ", }" must not be treated as a trailing comma —
+        // only unquoted structural commas are ever candidates.
+        let input = r#"{"a": "value, }", "b": 2}"#;
+        assert_eq!(strip_trailing_commas(input), input);
+    }
+
+    #[test]
+    fn handles_escaped_quotes_inside_strings() {
+        // The escaped quote must not end the string early, or the comma
+        // right after it would be misread as structural.
+        let input = r#"{"a": "she said \"hi,\"", "b": 2,}"#;
+        let expected = r#"{"a": "she said \"hi,\"", "b": 2}"#;
+        assert_eq!(strip_trailing_commas(input), expected);
+    }
+
+    #[test]
+    fn no_trailing_comma_is_a_no_op() {
+        let input = r#"{"a": [1, 2], "b": {"c": 3}}"#;
+        assert_eq!(strip_trailing_commas(input), input);
+    }
+}
+
 async fn read_or_default<T>(path: impl AsRef<Path>) -> Result<T, anyhow::Error>
 where
     T: DeserializeOwned + Serialize + Default,
 {
     match fs::read_to_string(path.as_ref()).await {
-        Ok(value) => serde_json::from_str(&value).map_err(|err| {
-            // serde_json gives 1-based line/column — extract the offending line for context
-            let line_no = err.line();
-            let col_no  = err.column();
-            let src_line = value
-                .lines()
-                .nth(line_no.saturating_sub(1))
-                .unwrap_or("");
-            let caret = " ".repeat(col_no.saturating_sub(1)) + "^";
-            anyhow::anyhow!(
-                "'{}' contains invalid JSON at line {}, column {}:\n\n  {}\n  {}\n\n{}\n\nFix the file and restart.",
-                path.as_ref().display(),
-                line_no,
-                col_no,
-                src_line,
-                caret,
-                err,
-            )
-        }),
+        Ok(value) => {
+            // Windows editors (Notepad, some PowerShell cmdlets) commonly save
+            // UTF-8 files with a leading BOM. It isn't valid JSON whitespace, so
+            // serde_json rejects an otherwise-correct file with a confusing
+            // "expected value at line 1 column 1" — strip it before parsing.
+            let value = value.strip_prefix('\u{FEFF}').unwrap_or(&value).to_string();
+            let value = strip_trailing_commas(&value);
+            serde_json::from_str(&value).map_err(|err| {
+                // serde_json gives 1-based line/column — extract the offending line for context
+                let line_no = err.line();
+                let col_no  = err.column();
+                let src_line = value
+                    .lines()
+                    .nth(line_no.saturating_sub(1))
+                    .unwrap_or("");
+                let caret = " ".repeat(col_no.saturating_sub(1)) + "^";
+                anyhow::anyhow!(
+                    "'{}' contains invalid JSON at line {}, column {}:\n\n  {}\n  {}\n\n{}\n\nFix the file and restart.",
+                    path.as_ref().display(),
+                    line_no,
+                    col_no,
+                    src_line,
+                    caret,
+                    err,
+                )
+            })
+        },
         Err(err) if err.kind() == ErrorKind::NotFound => {
             let value = T::default();
 
