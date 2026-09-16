@@ -589,7 +589,7 @@ Make sure you've cloned this repo with all it's submodules
 ```sh
 git clone --recursive https://github.com/Argon2000/moonlight-web-stream-tsla.git
 ```
-A [Rust](https://www.rust-lang.org/tools/install) [nightly](https://rust-lang.github.io/rustup/concepts/channels.html) installation is required.
+A [Rust](https://www.rust-lang.org/tools/install) [nightly](https://rust-lang.github.io/rustup/concepts/channels.html) installation is required. This repository pins a known-working toolchain in `rust-toolchain.toml`.
 
 There are 2 ways to build Moonlight Web:
 - Build it on your system

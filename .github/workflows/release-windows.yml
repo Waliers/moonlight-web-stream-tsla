@@ -33,8 +33,9 @@ jobs:
           cache-dependency-path: moonlight-web/web-server/package-lock.json
 
       - name: Set up Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@nightly-2025-08-01
         with:
+          toolchain: nightly-2025-08-01
           targets: x86_64-pc-windows-gnu
 
       - name: Cache Rust build outputs
