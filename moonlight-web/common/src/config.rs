@@ -146,6 +146,11 @@ fn default_pair_device_name() -> String {
 }
 
 fn default_streamer_path() -> String {
+    #[cfg(windows)]
+    {
+        return "./streamer.exe".to_string();
+    }
+
     "./streamer".to_string()
 }
 

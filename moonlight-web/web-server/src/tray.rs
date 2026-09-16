@@ -236,20 +236,20 @@ fn copy_url_to_clipboard() {
 }
 
 fn kill_streamer_processes() {
-    // Kill any running Streamer.exe processes when exiting
+    // Kill any running streamer.exe processes when exiting
     match std::process::Command::new("taskkill")
-        .args(&["/IM", "Streamer.exe", "/F"])
+        .args(&["/IM", "streamer.exe", "/F"])
         .output()
     {
         Ok(output) => {
             if output.status.success() {
-                info!("[Tray] Killed Streamer.exe process");
+                info!("[Tray] Killed streamer.exe process");
             } else {
                 // taskkill returns non-zero if no process is found, which is fine
-                debug!("[Tray] Streamer.exe process not running or already terminated");
+                debug!("[Tray] streamer.exe process not running or already terminated");
             }
         }
-        Err(e) => warn!("[Tray] Failed to kill Streamer.exe: {e}"),
+        Err(e) => warn!("[Tray] Failed to kill streamer.exe: {e}"),
     }
 }
 

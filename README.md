@@ -60,9 +60,16 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
 
 1. Install [Sunshine](http://github.com/LizardByte/Sunshine/releases/tag/v2026.516.143833)
 
-2. Download the [compressed archive](https://www.patreon.com/posts/windows-linux-158842535) for your platform and extract it
+2. Download the Windows release ZIP from [GitHub Releases](../../releases) and extract `moonlight-web-x86_64-pc-windows-gnu.zip`
 
 ### Windows (Easy Setup)
+
+The published Windows package targets **64-bit Windows 10/11** (`x86_64-pc-windows-gnu`) and extracts with:
+- `web-server.exe`
+- `streamer.exe`
+- `static/`
+- `setup.ps1`
+- `acme-certificate.ps1`
 
 The included `setup.ps1` wizard handles everything interactively:
 - Detects your network configuration
@@ -84,6 +91,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Or simply right-click `setup.ps1` → **Run with PowerShell** (it will self-elevate).
 
 Follow the prompts. The wizard will guide you through each step and explain what it is doing.
+
+To start manually after extracting the ZIP, run `.\web-server.exe` from the extracted folder.
 
 > **HTTPS / Tesla access:** Choose option 1 (Let's Encrypt) in the certificate step. You need a domain name first — see [Getting a free domain name](#getting-a-free-domain-name).
 
@@ -580,7 +589,7 @@ Make sure you've cloned this repo with all it's submodules
 ```sh
 git clone --recursive https://github.com/Argon2000/moonlight-web-stream-tsla.git
 ```
-A [Rust](https://www.rust-lang.org/tools/install) [nightly](https://rust-lang.github.io/rustup/concepts/channels.html) installation is required.
+A [Rust](https://www.rust-lang.org/tools/install) [nightly](https://rust-lang.github.io/rustup/concepts/channels.html) installation is required. This repository pins a known-working toolchain in `rust-toolchain.toml`.
 
 There are 2 ways to build Moonlight Web:
 - Build it on your system
@@ -598,6 +607,13 @@ There are 2 ways to build Moonlight Web:
   cross build --release --target YOUR_TARGET
   ```
   Note: windows only has the gnu target `x86_64-pc-windows-gnu`
+
+### GitHub Release build
+
+Pushing a version tag such as `v1.0.0` triggers `.github/workflows/release-windows.yml`.
+That workflow builds the frontend, cross-compiles the Rust workspace for `x86_64-pc-windows-gnu`,
+packages the Windows distribution, and publishes `moonlight-web-x86_64-pc-windows-gnu.zip` on
+the matching GitHub Release page.
 
 ### Crate: Moonlight Common Sys
 [moonlight-common-sys](./moonlight-common-sys/) are rust bindings to the cpp [moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c) library.

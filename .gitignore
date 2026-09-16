@@ -6,4 +6,6 @@ ignore
 # VsCode
 .vscode
 
-.github
+.github/*
+!.github/workflows/
+!.github/workflows/**
