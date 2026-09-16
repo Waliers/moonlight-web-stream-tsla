@@ -1,15 +1,28 @@
-# Resolving paths
-$ErrorActionPreference = "Continue"
+param(
+    [string[]]$Targets = @(
+        "x86_64-pc-windows-gnu"
+        "x86_64-unknown-linux-gnu"
+        "arm-unknown-linux-gnueabihf"
+        "aarch64-unknown-linux-gnu"
+    ),
+    [string]$OutputDir = "./finalOutput"
+)
+
+$ErrorActionPreference = "Stop"
 
 $metadataJson = cargo metadata --format-version 1 --no-deps
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo metadata failed"
+}
 $metadata = $metadataJson | ConvertFrom-Json
 $targetDir = $metadata.target_directory
 
-New-Item -ItemType Directory "./finalOutput" -Force
-$outputDir = Resolve-Path "./finalOutput"
+New-Item -ItemType Directory $OutputDir -Force | Out-Null
+$outputDir = (Resolve-Path $OutputDir).Path
 
-$moonlightRoot = Resolve-Path "."
-$moonlightFrontend = Join-Path -Path $moonlightRoot -ChildPath "/moonlight-web/web-server"
+$moonlightRoot = (Resolve-Path ".").Path
+$moonlightFrontend = Join-Path -Path $moonlightRoot -ChildPath "moonlight-web/web-server"
+$frontendStaticDir = Join-Path -Path $outputDir -ChildPath "_frontend-static"
 
 function Get-BuildAssetHash {
     param(
@@ -94,28 +107,168 @@ function Add-CacheBustToReferences {
     }
 }
 
-if(!$moonlightRoot -or !$moonlightFrontend) {
-    Write-Output "No root directory found!"
-    exit 0
+function Get-BuildExecutables {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$messages,
+
+        [Parameter(Mandatory = $true)]
+        [string]$target
+    )
+
+    $expectedNames = if ($target -like "*windows*") {
+        @("web-server.exe", "streamer.exe")
+    }
+    else {
+        @("web-server", "streamer")
+    }
+
+    $executables = $messages |
+        Where-Object {
+            $_.reason -eq "compiler-artifact" -and
+            $_.executable -and
+            @($_.target.kind) -contains "bin" -and
+            -not $_.profile.test
+        } |
+        ForEach-Object { $_.executable } |
+        Sort-Object -Unique
+
+    $resolved = foreach ($expectedName in $expectedNames) {
+        $match = $executables | Where-Object { [System.IO.Path]::GetFileName($_) -eq $expectedName }
+        if (-not $match) {
+            throw "Missing expected executable '$expectedName' for target '$target'"
+        }
+        @($match)[0]
+    }
+
+    return $resolved
+}
+
+function New-PackageDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$packageDir,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$binaryPaths,
+
+        [Parameter(Mandatory = $true)]
+        [string]$staticDir,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$includeWindowsScripts
+    )
+
+    if (Test-Path $packageDir) {
+        Remove-Item -Path $packageDir -Recurse -Force
+    }
+    New-Item -ItemType Directory $packageDir -Force | Out-Null
+
+    foreach ($binaryPath in $binaryPaths) {
+        if (-not (Test-Path $binaryPath)) {
+            throw "Binary not found: $binaryPath"
+        }
+        Copy-Item -Path $binaryPath -Destination (Join-Path $packageDir ([System.IO.Path]::GetFileName($binaryPath))) -Force
+    }
+
+    Copy-Item -Path $staticDir -Destination (Join-Path $packageDir "static") -Recurse -Force
+
+    if ($includeWindowsScripts) {
+        Copy-Item -Path (Join-Path $moonlightRoot "setup.ps1") -Destination (Join-Path $packageDir "setup.ps1") -Force
+        Copy-Item -Path (Join-Path $moonlightRoot "acme-certificate.ps1") -Destination (Join-Path $packageDir "acme-certificate.ps1") -Force
+    }
+}
+
+function Assert-PackageLayout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$packageDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$target
+    )
+
+    $required = @(
+        "static"
+        if ($target -like "*windows*") { "web-server.exe" } else { "web-server" }
+        if ($target -like "*windows*") { "streamer.exe" } else { "streamer" }
+    )
+
+    if ($target -like "*windows*") {
+        $required += @("setup.ps1", "acme-certificate.ps1")
+    }
+
+    foreach ($name in $required) {
+        $path = Join-Path $packageDir $name
+        if (-not (Test-Path $path)) {
+            throw "Package for '$target' is missing '$name'"
+        }
+    }
+}
+
+function New-ArchiveFromPackageDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$packageDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$archiveBasePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$target
+    )
+
+    Push-Location $packageDir
+    try {
+        if ($target -like "*windows*") {
+            $zipDestination = "${archiveBasePath}.zip"
+            if (Test-Path $zipDestination) {
+                Remove-Item $zipDestination -Force
+            }
+            7z a -tzip $zipDestination ./* -y
+            if ($LASTEXITCODE -ne 0) {
+                throw "7z zip failed for '$target'"
+            }
+            return $zipDestination
+        }
+
+        $tarDestination = "${archiveBasePath}.tar"
+        $gzDestination = "${archiveBasePath}.tar.gz"
+        if (Test-Path $tarDestination) {
+            Remove-Item $tarDestination -Force
+        }
+        if (Test-Path $gzDestination) {
+            Remove-Item $gzDestination -Force
+        }
+
+        7z a -ttar $tarDestination ./* -y
+        if ($LASTEXITCODE -ne 0) {
+            throw "7z tar failed for '$target'"
+        }
+        7z a -tgzip $gzDestination $tarDestination -y
+        if ($LASTEXITCODE -ne 0) {
+            throw "7z gzip failed for '$target'"
+        }
+        Remove-Item $tarDestination -Force
+        return $gzDestination
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+if (-not $moonlightRoot -or -not $moonlightFrontend) {
+    throw "No root directory found"
 }
 
 Write-Output "Target directory at $targetDir"
 Write-Output "Putting final output into $outputDir"
 Write-Output "Moonlight Root Directory $moonlightRoot"
 
-$targets = @(
-    "x86_64-pc-windows-gnu"
-    "x86_64-unknown-linux-gnu"
-    "arm-unknown-linux-gnueabihf"
-    "aarch64-unknown-linux-gnu"
-)
-
-Remove-Item -Path "$outputDir/*" -Recurse -Force
+Get-ChildItem -Path $outputDir -Force | Remove-Item -Recurse -Force
 
 Write-Output "------------- Starting Build for Frontend -------------"
 Set-Location $moonlightFrontend
-
-New-Item -ItemType Directory "$outputDir/static" -Force | Out-Null
 
 if (Test-Path "$moonlightFrontend/dist") {
     Remove-Item -Path "$moonlightFrontend/dist" -Recurse -Force
@@ -123,8 +276,7 @@ if (Test-Path "$moonlightFrontend/dist") {
 $env:CARGO_TERM_COLOR = "never"
 npm run build
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Frontend build failed!"
-    exit $LASTEXITCODE
+    throw "Frontend build failed"
 }
 
 $frontendDist = Join-Path -Path $moonlightFrontend -ChildPath "dist"
@@ -132,17 +284,17 @@ $assetHash = Get-BuildAssetHash -distDir $frontendDist
 Write-Output "Applying frontend cache-bust hash: $assetHash"
 Add-CacheBustToReferences -distDir $frontendDist -versionHash $assetHash
 
-Copy-Item -Path "$moonlightFrontend/dist/*" -Destination "$outputDir/static" -Recurse -Force
+if (Test-Path $frontendStaticDir) {
+    Remove-Item -Path $frontendStaticDir -Recurse -Force
+}
+Copy-Item -Path $frontendDist -Destination $frontendStaticDir -Recurse -Force
 Write-Output "------------- Finished Build for Frontend -------------"
 
 Set-Location $moonlightRoot
 
-foreach($target in $targets) {
+foreach ($target in $Targets) {
     Write-Output "------------- Starting Build for $target -------------"
     $messages = cross build --release --target $target --message-format=json 2>&1 | ForEach-Object {
-        # cross/docker writes progress lines to stderr; merge them to stdout so PowerShell
-        # doesn't treat them as errors (red RemoteException). Non-JSON lines are progress
-        # messages — print them directly; JSON lines are cargo metadata to collect.
         if ($_ -is [System.Management.Automation.ErrorRecord]) {
             Write-Host $_.Exception.Message
             return
@@ -154,47 +306,23 @@ foreach($target in $targets) {
     }
     Write-Output "------------- Finished Build for $target -------------"
 
-    $artifact = $messages | Where-Object { $_.reason -eq "compiler-artifact" -and $_.executable }
-    $binaryPaths = $artifact | ForEach-Object { Join-Path -Path $targetDir -ChildPath ($_.executable.Substring("/target".length)) }
-
+    $binaryPaths = Get-BuildExecutables -messages $messages -target $target
     $binaryPaths | ForEach-Object { Write-Host "Binary: $_" }
 
-    Write-Output "------------- Starting Zipping for $target -------------"
-    $itemsToZip = @($binaryPaths) + "$outputDir/static"
-    if ($target -clike "*windows*") {
-        $itemsToZip += "$moonlightRoot/acme-certificate.ps1"
-        $itemsToZip += "$moonlightRoot/setup.ps1"
-    }# else {
-    #    $itemsToZip += "$moonlightRoot/acme-certificate.sh"
-    #}
-    $archiveName = "$outputDir/moonlight-web-$target"
+    Write-Output "------------- Starting Packaging for $target -------------"
+    $packageDir = Join-Path $outputDir "$target-package"
+    New-PackageDirectory `
+        -packageDir $packageDir `
+        -binaryPaths $binaryPaths `
+        -staticDir $frontendStaticDir `
+        -includeWindowsScripts ($target -like "*windows*")
 
-    if ($target -clike "*windows*") {
-        # Create zip
-        $zipDestination = "$archiveName.zip"
-        7z a -tzip $zipDestination $itemsToZip -y
-    } else {
-        # Create tar.gz
-        New-Item -ItemType Directory "$archiveName" -Force | Out-Null
+    Assert-PackageLayout -packageDir $packageDir -target $target
 
-        foreach ($item in $itemsToZip) {
-            Copy-Item $item -Recurse -Destination $archiveName
-        }
-
-        $tarDestination = "$archiveName.tar"
-        $gzDestination = "$archiveName.tar.gz"
-        7z a -ttar $tarDestination $archiveName -y
-        7z a -tgzip $gzDestination $tarDestination -y
-        
-        Remove-Item $tarDestination
-
-        Remove-Item $archiveName -Recurse
-    }
-
-    Write-Output "Created Zip file at $archiveName"
-    Write-Output "------------- Finished Zipping for $target -------------"
+    $archiveName = Join-Path $outputDir "moonlight-web-$target"
+    $archivePath = New-ArchiveFromPackageDirectory -packageDir $packageDir -archiveBasePath $archiveName -target $target
+    Write-Output "Created archive at $archivePath"
+    Write-Output "------------- Finished Packaging for $target -------------"
 }
-
-Remove-Item "$outputDir/static" -Recurse
 
 Write-Output "Finished!"

@@ -432,7 +432,7 @@ if (Test-Path $configPath) {
         webrtc_network_types = @("udp4")
         web_path_prefix = ""
         certificate = $null
-        streamer_path = "./streamer"
+        streamer_path = "./streamer.exe"
         external_url = $null
     }
 }

@@ -14,6 +14,7 @@ use common::{api_bindings::ConfigJs, config::Config};
 use log::warn;
 
 use crate::api::auth::ApiCredentials;
+use crate::paths::web_asset_dir;
 
 /// Per-request cache policy for static assets.
 ///
@@ -53,11 +54,7 @@ async fn static_cache_headers(
 }
 
 pub fn web_service() -> impl HttpServiceFactory {
-    #[cfg(debug_assertions)]
-    let files = Files::new("/", "dist").index_file("index.html");
-
-    #[cfg(not(debug_assertions))]
-    let files = Files::new("/", "static").index_file("index.html");
+    let files = Files::new("/", web_asset_dir()).index_file("index.html");
 
     web::scope("")
         .wrap(from_fn(static_cache_headers))

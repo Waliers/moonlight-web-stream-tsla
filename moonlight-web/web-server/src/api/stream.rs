@@ -29,6 +29,7 @@ use tokio::{
 use crate::{
     api::auth::ApiCredentials,
     data::{ActiveStream, RuntimeApiData},
+    paths::resolve_streamer_path,
 };
 
 /// The stream handler WILL authenticate the client because it is a websocket
@@ -306,7 +307,8 @@ async fn spawn_streamer_process(
     }
 
     // Spawn child
-    let (mut child, stdin, stdout) = match Command::new(&config.streamer_path)
+    let streamer_path = resolve_streamer_path(&config);
+    let (mut child, stdin, stdout) = match Command::new(&streamer_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -335,7 +337,10 @@ async fn spawn_streamer_process(
             }
         }
         Err(err) => {
-            error!("[Stream]: failed to spawn streamer process: {err:?}");
+            error!(
+                "[Stream]: failed to spawn streamer process '{}': {err:?}",
+                streamer_path.display()
+            );
 
             if let Some(mut session) = primary_session.take() {
                 let _ = send_ws_message(&mut session, StreamServerMessage::InternalServerError).await;

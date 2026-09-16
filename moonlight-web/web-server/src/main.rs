@@ -25,12 +25,14 @@ use crate::{
     acme::{acme_challenge_service, acme_api_service, new_challenge_store},
     api::{api_service, auth::ApiCredentials},
     data::{ApiData, RuntimeApiData},
+    paths::validate_runtime_layout,
     web::{web_config_js_service, web_service},
 };
 
 mod acme;
 mod api;
 mod data;
+mod paths;
 #[cfg(windows)]
 mod tray;
 mod web;
@@ -127,6 +129,7 @@ async fn main2() -> Result<(), anyhow::Error> {
             errors.join("\n  • ")
         );
     }
+    validate_runtime_layout(&config)?;
 
     let creds = ApiCredentials::new(
         config.credentials.clone(),
