@@ -10,6 +10,7 @@ ENV MOONLIGHT_COMMON_CROSS=1
 FROM base AS win
 
 # -- Overwrite system MinGW-w64 headers with latest version
+ENV MINGW_INCLUDE_DIR=/usr/x86_64-w64-mingw32/include
 WORKDIR /tmp
 
 # Download latest headers from GitHub without relying on apt inside the image
@@ -17,14 +18,14 @@ RUN curl -L https://github.com/mirror/mingw-w64/archive/refs/heads/master.tar.gz
     tar -xzf mingw-w64-headers.tar.gz
 
 # Copy headers into system MinGW-w64 include folder, overwriting old files
-RUN cp -r mingw-w64-master/mingw-w64-headers/include/* $CROSS_SYSROOT/include/ && \
+RUN cp -r mingw-w64-master/mingw-w64-headers/include/* $MINGW_INCLUDE_DIR/ && \
     rm -rf /tmp/*
 
 # -- Some moonlight common c files require windows headers but they have them capitalized so we just symlink them to fix that
-RUN ln -s $CROSS_SYSROOT/include/ws2tcpip.h $CROSS_SYSROOT/include/Ws2tcpip.h && \
-    ln -s $CROSS_SYSROOT/include/mswsock.h $CROSS_SYSROOT/include/Mswsock.h && \
-    ln -s $CROSS_SYSROOT/include/versionhelpers.h $CROSS_SYSROOT/include/VersionHelpers.h && \
-    ln -s $CROSS_SYSROOT/include/windows.h $CROSS_SYSROOT/include/Windows.h && \
-    ln -s $CROSS_SYSROOT/include/winsock2.h $CROSS_SYSROOT/include/Winsock2.h && \
+RUN ln -s $MINGW_INCLUDE_DIR/ws2tcpip.h $MINGW_INCLUDE_DIR/Ws2tcpip.h && \
+    ln -s $MINGW_INCLUDE_DIR/mswsock.h $MINGW_INCLUDE_DIR/Mswsock.h && \
+    ln -s $MINGW_INCLUDE_DIR/versionhelpers.h $MINGW_INCLUDE_DIR/VersionHelpers.h && \
+    ln -s $MINGW_INCLUDE_DIR/windows.h $MINGW_INCLUDE_DIR/Windows.h && \
+    ln -s $MINGW_INCLUDE_DIR/winsock2.h $MINGW_INCLUDE_DIR/Winsock2.h && \
     # For some reason the stdbool.h is not in the include path
-    ln -s /usr/lib/gcc/x86_64-w64-mingw32/$($CROSS_TOOLCHAIN_PREFIX"gcc"$CROSS_TOOLCHAIN_SUFFIX -dumpversion)/include/stdbool.h $CROSS_SYSROOT/include/stdbool.h
+    ln -s /usr/lib/gcc/x86_64-w64-mingw32/$(x86_64-w64-mingw32-gcc -dumpversion)/include/stdbool.h $MINGW_INCLUDE_DIR/stdbool.h

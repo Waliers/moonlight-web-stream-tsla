@@ -110,10 +110,10 @@ function Add-CacheBustToReferences {
 function Get-BuildExecutables {
     param(
         [Parameter(Mandatory = $true)]
-        [object[]]$messages,
+        [string]$target,
 
         [Parameter(Mandatory = $true)]
-        [string]$target
+        [string]$targetDir
     )
 
     $expectedNames = if ($target -like "*windows*") {
@@ -123,22 +123,12 @@ function Get-BuildExecutables {
         @("web-server", "streamer")
     }
 
-    $executables = $messages |
-        Where-Object {
-            $_.reason -eq "compiler-artifact" -and
-            $_.executable -and
-            @($_.target.kind) -contains "bin" -and
-            -not $_.profile.test
-        } |
-        ForEach-Object { $_.executable } |
-        Sort-Object -Unique
-
     $resolved = foreach ($expectedName in $expectedNames) {
-        $match = $executables | Where-Object { [System.IO.Path]::GetFileName($_) -eq $expectedName }
-        if (-not $match) {
-            throw "Missing expected executable '$expectedName' for target '$target'"
+        $path = Join-Path $targetDir "$target/release/$expectedName"
+        if (-not (Test-Path $path)) {
+            throw "Missing expected executable '$expectedName' for target '$target' at '$path'"
         }
-        @($match)[0]
+        (Resolve-Path $path).Path
     }
 
     return $resolved
@@ -306,7 +296,7 @@ foreach ($target in $Targets) {
     }
     Write-Output "------------- Finished Build for $target -------------"
 
-    $binaryPaths = Get-BuildExecutables -messages $messages -target $target
+    $binaryPaths = Get-BuildExecutables -target $target -targetDir $targetDir
     $binaryPaths | ForEach-Object { Write-Host "Binary: $_" }
 
     Write-Output "------------- Starting Packaging for $target -------------"
