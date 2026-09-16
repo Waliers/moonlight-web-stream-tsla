@@ -1,0 +1,168 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install system packages
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y file p7zip-full unzip wine64
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: moonlight-web/web-server/package-lock.json
+
+      - name: Set up Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Install frontend dependencies
+        working-directory: moonlight-web/web-server
+        run: npm ci
+
+      - name: Build Windows release package
+        shell: pwsh
+        run: ./buildAll.ps1 -Targets x86_64-pc-windows-gnu -OutputDir ./finalOutput
+
+      - name: Verify compiled Windows executables
+        run: |
+          set -euxo pipefail
+          for exe in \
+            target/x86_64-pc-windows-gnu/release/web-server.exe \
+            target/x86_64-pc-windows-gnu/release/streamer.exe
+          do
+            test -s "$exe"
+            file "$exe" | tee /dev/stderr | grep -Eq 'PE32\+ executable .* x86-64.* MS Windows'
+          done
+          test ! -e finalOutput/moonlight-web-x86_64-unknown-linux-gnu.tar.gz
+          test ! -e finalOutput/moonlight-web-arm-unknown-linux-gnueabihf.tar.gz
+          test ! -e finalOutput/moonlight-web-aarch64-unknown-linux-gnu.tar.gz
+
+      - name: Verify release ZIP contents
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          zip_path = Path("finalOutput/moonlight-web-x86_64-pc-windows-gnu.zip")
+          if not zip_path.is_file():
+              raise SystemExit(f"missing release asset: {zip_path}")
+
+          with zipfile.ZipFile(zip_path) as zf:
+              names = set(zf.namelist())
+              required_files = {"web-server.exe", "streamer.exe", "setup.ps1", "acme-certificate.ps1"}
+              missing_files = sorted(name for name in required_files if name not in names)
+              if missing_files:
+                  raise SystemExit(f"zip is missing required files: {missing_files}")
+              if not any(name.startswith("static/") and not name.endswith("/") for name in names):
+                  raise SystemExit("zip does not contain populated static/ assets")
+          PY
+
+      - name: Smoke test extracted Windows package with Wine
+        run: |
+          set -euxo pipefail
+          smoke_dir=/tmp/moonlight-web-windows-smoke
+          rm -rf "$smoke_dir"
+          mkdir -p "$smoke_dir"
+          7z x -y -o"$smoke_dir" finalOutput/moonlight-web-x86_64-pc-windows-gnu.zip >/dev/null
+          mkdir -p "$smoke_dir/server"
+          cat > "$smoke_dir/server/config.json" <<'JSON'
+          {
+            "credentials": null,
+            "totp_secret": null,
+            "data_path": "server/data.json",
+            "bind_address": "127.0.0.1:43780",
+            "moonlight_default_http_port": 47989,
+            "pair_device_name": "roth",
+            "webrtc_ice_servers": [
+              {
+                "urls": [
+                  "stun:stun.cloudflare.com:3478"
+                ],
+                "username": "",
+                "credential": ""
+              }
+            ],
+            "webrtc_port_range": {
+              "min": 40000,
+              "max": 40100
+            },
+            "webrtc_nat_1to1": null,
+            "webrtc_network_types": [
+              "udp4"
+            ],
+            "web_path_prefix": "",
+            "certificate": null,
+            "streamer_path": "./streamer.exe",
+            "external_url": null
+          }
+          JSON
+
+          WINEDEBUG=-all wine64 "$smoke_dir/web-server.exe" >"$smoke_dir/web-server.log" 2>&1 &
+          wine_pid=$!
+          cleanup() {
+            kill "$wine_pid" 2>/dev/null || true
+            wait "$wine_pid" 2>/dev/null || true
+            wineserver -k 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          python - <<'PY'
+          import http.client
+          import time
+
+          deadline = time.time() + 45
+          last_error = None
+          while time.time() < deadline:
+              try:
+                  conn = http.client.HTTPConnection("127.0.0.1", 43780, timeout=5)
+                  conn.request("GET", "/")
+                  res = conn.getresponse()
+                  body = res.read().decode("utf-8", errors="replace")
+                  if res.status == 200 and "<html" in body.lower():
+                      break
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(1)
+              else:
+                  time.sleep(1)
+          else:
+              raise SystemExit(f"web-server.exe did not become healthy: {last_error}")
+          PY
+
+          curl -fsS http://127.0.0.1:43780/config.js | grep -F 'path_prefix'
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: finalOutput/moonlight-web-x86_64-pc-windows-gnu.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
